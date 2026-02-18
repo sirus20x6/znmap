@@ -1,0 +1,32 @@
+=== Nmap Benchmark Suite ===
+Date: 2026-02-18T10:22:07-06:00
+Nmap: Nmap version 7.98SVN ( https://nmap.org )
+Kernel: 6.18.9-zen1-2.1-zen
+CPU: AMD EPYC 7473X 24-Core Processor
+Iterations per test: 3
+Running as root: 0
+
+NOTE: Running unprivileged — using connect scans (-sT) instead of SYN scans (-sS)
+
+--- Connect scan (1000 ports) ---
+Command: /thearray/git/security/nmap/benchmarks/../nmap -sT -p1-1000 127.0.0.1
+  Run 1: wall=.0873s
+  Run 2: wall=.0953s
+  Run 3: wall=.0935s
+
+--- Service version scan ---
+Command: /thearray/git/security/nmap/benchmarks/../nmap -sV -p22,80,443 127.0.0.1
+  Run 1: wall=.2431s
+  Run 2: wall=.2361s
+  Run 3: wall=.2325s
+
+--- Full connect scan (10000 ports) ---
+Command: /thearray/git/security/nmap/benchmarks/../nmap -sT -sV -p1-10000 127.0.0.1
+  Run 1: wall=201.8192s
+  Run 2: wall=201.8081s
+  (Run 3 interrupted — 10K port scan frozen)
+
+--- Checksum microbenchmark ---
+  (Zig SIMD: ~0.046s per 1M iterations — see phase1-simd-checksum.txt)
+
+=== Benchmark complete (partial — full scan run 3 interrupted) ===
