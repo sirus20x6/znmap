@@ -511,6 +511,125 @@ static void test_file_name(const char *filename, const char *option) {
   }
 }
 
+/* load_nmaprc -- Load options from ~/.nmaprc or $NMAPRC config file.
+   Reads the file line-by-line, ignoring comments (#) and blank lines.
+   Tokens are split on whitespace and prepended to the command-line argv
+   so that actual command-line options override config file defaults.
+   If --no-nmaprc is present in argv, the config file is skipped entirely.
+   Returns true if argv was replaced (caller should use new_argc/new_argv). */
+static bool load_nmaprc(int argc, char **argv, int *new_argc, char ***new_argv) {
+  *new_argc = argc;
+  *new_argv = argv;
+
+  /* Check for --no-nmaprc before doing anything */
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--no-nmaprc") == 0)
+      return false;
+  }
+
+  /* Determine config file path */
+  const char *rcpath = getenv("NMAPRC");
+  char pathbuf[4096];
+  if (rcpath == NULL || rcpath[0] == '\0') {
+    const char *home = getenv("HOME");
+#ifdef WIN32
+    if (home == NULL || home[0] == '\0') {
+      home = getenv("USERPROFILE");
+    }
+#endif
+    if (home == NULL || home[0] == '\0')
+      return false;
+    if (snprintf(pathbuf, sizeof(pathbuf), "%s/.nmaprc", home) >= (int)sizeof(pathbuf))
+      return false;
+    rcpath = pathbuf;
+  }
+
+  /* Try to open the file */
+  FILE *fp = fopen(rcpath, "r");
+  if (fp == NULL)
+    return false; /* Missing file is not an error */
+
+  /* Read tokens from the file */
+  std::vector<char *> config_tokens;
+  char line[4096];
+  int lineno = 0;
+
+  while (fgets(line, sizeof(line), fp) != NULL) {
+    lineno++;
+    /* Strip trailing newline */
+    size_t len = strlen(line);
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+      line[--len] = '\0';
+
+    /* Skip leading whitespace */
+    char *p = line;
+    while (*p == ' ' || *p == '\t')
+      p++;
+
+    /* Skip empty lines and comments */
+    if (*p == '\0' || *p == '#')
+      continue;
+
+    /* Tokenize on whitespace */
+    bool got_token = false;
+    while (*p != '\0') {
+      /* Skip whitespace between tokens */
+      while (*p == ' ' || *p == '\t')
+        p++;
+      if (*p == '\0' || *p == '#')
+        break;
+
+      /* Find end of token */
+      char *tok_start = p;
+      while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '#')
+        p++;
+
+      /* Extract token */
+      char saved = *p;
+      *p = '\0';
+      config_tokens.push_back(strdup(tok_start));
+      got_token = true;
+      if (saved == '#')
+        break; /* Rest of line is a comment */
+      if (saved != '\0')
+        p++;
+    }
+
+    if (!got_token) {
+      /* Line had content but no valid tokens -- warn */
+      error("Warning: Skipping malformed line %d in %s", lineno, rcpath);
+    }
+  }
+
+  fclose(fp);
+
+  if (config_tokens.empty())
+    return false;
+
+  /* Build new argv: [argv[0], config_tokens..., argv[1:]...] */
+  int total = 1 + (int)config_tokens.size() + (argc - 1);
+  char **nargv = (char **) safe_malloc((total + 1) * sizeof(char *));
+
+  int idx = 0;
+  nargv[idx++] = argv[0]; /* program name */
+
+  for (size_t i = 0; i < config_tokens.size(); i++)
+    nargv[idx++] = config_tokens[i];
+
+  for (int i = 1; i < argc; i++)
+    nargv[idx++] = argv[i];
+
+  nargv[idx] = NULL;
+
+  *new_argc = total;
+  *new_argv = nargv;
+
+  if (o.debugging)
+    error("Loaded %d option token(s) from %s", (int)config_tokens.size(), rcpath);
+
+  return true;
+}
+
 void parse_options(int argc, char **argv) {
   char *p;
   int arg;
@@ -629,6 +748,7 @@ void parse_options(int argc, char **argv) {
     {"disable-arp-ping", no_argument, 0, 0},
     {"route-dst", required_argument, 0, 0},
     {"resume", required_argument, 0, 0},
+    {"no-nmaprc", no_argument, 0, 0},
     {0, 0, 0, 0}
   };
 
@@ -1010,6 +1130,8 @@ void parse_options(int argc, char **argv) {
           route_dst_hosts.push_back(optarg);
         } else if (strcmp(long_options[option_index].name, "resume") == 0) {
           fatal("Cannot use --resume with other options. Usage: nmap --resume <filename>");
+        } else if (strcmp(long_options[option_index].name, "no-nmaprc") == 0) {
+          /* Already handled before parse_options(); nothing to do here. */
         } else {
           fatal("Unknown long option (%s) given@#!$#$", long_options[option_index].name);
         }
@@ -1945,6 +2067,17 @@ int nmap_main(int argc, char *argv[]) {
   win_pre_init();
 #endif
 
+  /* Load options from ~/.nmaprc config file, if present.
+     Config file options are prepended so command-line args override them. */
+  {
+    int rc_argc;
+    char **rc_argv;
+    if (load_nmaprc(argc, argv, &rc_argc, &rc_argv)) {
+      argc = rc_argc;
+      argv = rc_argv;
+    }
+  }
+
   parse_options(argc, argv);
 
   if (o.debugging)
@@ -2379,16 +2512,27 @@ int nmap_main(int argc, char *argv[]) {
       currenths = Targets[targetno];
       /* Now I can do the output and such for each host */
       if (currenths->timedOut(NULL)) {
+        /* --open means don't show hosts without open ports, even timed-out ones. */
+        if (o.openOnly() && !currenths->ports.hasOpenPorts())
+          continue;
+
         xml_open_start_tag("host");
         xml_attribute("starttime", "%lu", (unsigned long) currenths->StartTime());
         xml_attribute("endtime", "%lu", (unsigned long) currenths->EndTime());
         xml_attribute("timedout", "true");
         xml_close_start_tag();
         write_host_header(currenths);
+        /* Emit whatever partial results were gathered before the timeout.
+           All print functions handle empty/partial data gracefully. */
+        printportoutput(currenths, &currenths->ports);
+        printmacinfo(currenths);
+        printosscanoutput(currenths);
+        printserviceinfooutput(currenths);
         printtimes(currenths);
+        log_write(LOG_PLAIN | LOG_MACHINE, "\n");
         xml_end_tag(); /* host */
         xml_newline();
-        log_write(LOG_PLAIN, "Skipping host %s due to host timeout\n",
+        log_write(LOG_PLAIN, "Host %s timed out (partial results shown)\n",
                   currenths->NameIP(hostname, sizeof(hostname)));
         log_write(LOG_MACHINE, "Host: %s (%s)\tStatus: Timeout\n",
                   currenths->targetipstr(), currenths->HostName());

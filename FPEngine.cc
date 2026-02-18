@@ -79,6 +79,8 @@ extern NmapOps o;
 #endif
 
 #include <math.h>
+#include <stdlib.h>
+#include "zig/fp_match.h"
 
 
 /******************************************************************************
@@ -1011,7 +1013,51 @@ int label_prob_cmp(const void *a, const void *b) {
    tend to make small differences count a lot (because we probably want this
    fingerprint in order to expand the class), while still allowing near-perfect
    matches to match. */
-static double novelty_of(const struct feature_node *features, int label) {
+/* SIMD-accelerated novelty calculation via Zig fp_match module.
+   Precomputes inverse variances to avoid division in the hot loop and
+   uses SIMD vector operations for the distance computation. */
+static double novelty_of_simd(const struct feature_node *features, int label) {
+  int i, nr_feature;
+  const double *means, *variances;
+
+  nr_feature = get_nr_feature(&FPModel);
+  assert(0 <= label);
+  assert(label < nr_feature);
+
+  means = FPmean[label];
+  variances = FPvariance[label];
+
+  /* Pack observed values into f32 array. */
+  float *obs = (float *)alloca(nr_feature * sizeof(float));
+  for (i = 0; i < nr_feature; i++) {
+    assert(i + 1 == features[i].index);
+    obs[i] = (float)features[i].value;
+  }
+
+  /* Pack single reference: [means..., inv_variances...] */
+  int stride = 2 * nr_feature;
+  float *ref = (float *)alloca(stride * sizeof(float));
+  for (i = 0; i < nr_feature; i++) {
+    ref[i] = (float)means[i];
+    double v = variances[i];
+    ref[nr_feature + i] = (v == 0.0) ? 100.0f : (float)(1.0 / v);
+  }
+
+  float score;
+  fp_distance_batch(obs, (uint32_t)nr_feature, ref, 1, (uint32_t)stride, &score);
+
+  /* fp_distance_batch returns the squared Mahalanobis distance;
+     the original code returns sqrt(sum). */
+  return sqrt((double)score);
+}
+
+/* Single-label novelty computation; retained for use outside classify().
+   In classify(), novelty_batch() is used instead for better throughput. */
+static double __attribute__((unused)) novelty_of(const struct feature_node *features, int label) {
+  return novelty_of_simd(features, label);
+
+#if 0
+  /* Original scalar implementation kept for reference. */
   const double *means, *variances;
   int i, nr_feature;
   double sum;
@@ -1031,15 +1077,85 @@ static double novelty_of(const struct feature_node *features, int label) {
     d = features[i].value - means[i];
     v = variances[i];
     if (v == 0.0) {
-      /* No variance? It means that samples were identical. Substitute a default
-         variance. This will tend to make novelty large in these cases, which
-         will hopefully encourage for submissions for this class. */
       v = 0.01;
     }
     sum += d * d / v;
   }
 
   return sqrt(sum);
+#endif
+}
+
+/* Cached reference database for batch novelty computation.
+   Built once on first call and reused for all subsequent calls.
+   Layout: for each class c in [0..nr_class), stride floats where
+   [c*stride .. c*stride+nr_feature-1] = means[c][],
+   [c*stride+nr_feature .. c*stride+2*nr_feature-1] = inv_variances[c][]. */
+static float *cached_ref_db = NULL;
+static int cached_nr_class = -1;
+static int cached_nr_feature = -1;
+
+/* Build or return the cached reference database for all classes. */
+static void ensure_ref_db_cached(void) {
+  int nr_class = get_nr_class(&FPModel);
+  int nr_feature = get_nr_feature(&FPModel);
+
+  if (cached_ref_db != NULL && cached_nr_class == nr_class && cached_nr_feature == nr_feature)
+    return;
+
+  /* Free any stale cache. */
+  free(cached_ref_db);
+
+  int stride = 2 * nr_feature;
+  cached_ref_db = (float *)malloc((size_t)nr_class * stride * sizeof(float));
+  if (cached_ref_db == NULL)
+    fatal("novelty_batch: failed to allocate reference DB (%d classes x %d stride)",
+          nr_class, stride);
+
+  for (int c = 0; c < nr_class; c++) {
+    const double *means = FPmean[c];
+    const double *variances = FPvariance[c];
+    float *row = &cached_ref_db[c * stride];
+    for (int i = 0; i < nr_feature; i++) {
+      row[i] = (float)means[i];
+      double v = variances[i];
+      row[nr_feature + i] = (v == 0.0) ? 100.0f : (float)(1.0 / v);
+    }
+  }
+
+  cached_nr_class = nr_class;
+  cached_nr_feature = nr_feature;
+}
+
+/* Compute novelty for ALL classes at once using SIMD batch distance.
+   Returns a caller-owned array of nr_class doubles (sqrt of Mahalanobis).
+   Caller must delete[] the result. */
+static double *novelty_batch(const struct feature_node *features) {
+  int nr_class = get_nr_class(&FPModel);
+  int nr_feature = get_nr_feature(&FPModel);
+  int stride = 2 * nr_feature;
+
+  ensure_ref_db_cached();
+
+  /* Pack observed values into f32 array. */
+  float *obs = (float *)alloca(nr_feature * sizeof(float));
+  for (int i = 0; i < nr_feature; i++) {
+    assert(i + 1 == features[i].index);
+    obs[i] = (float)features[i].value;
+  }
+
+  /* Allocate scores array and run batch SIMD distance. */
+  float *scores = new float[nr_class];
+  fp_distance_batch(obs, (uint32_t)nr_feature, cached_ref_db,
+                    (uint32_t)nr_class, (uint32_t)stride, scores);
+
+  /* Convert squared distances to sqrt (matching novelty_of semantics). */
+  double *novelties = new double[nr_class];
+  for (int i = 0; i < nr_class; i++)
+    novelties[i] = sqrt((double)scores[i]);
+
+  delete[] scores;
+  return novelties;
 }
 
 static void classify(FingerPrintResultsIPv6 *FPR) {
@@ -1062,6 +1178,12 @@ static void classify(FingerPrintResultsIPv6 *FPR) {
     labels[i].prob = 1.0 / (1.0 + exp(-values[i]));
   }
   qsort(labels, nr_class, sizeof(labels[0]), label_prob_cmp);
+
+  /* Precompute all class novelties in a single SIMD batch pass.
+     This replaces per-label novelty_of() calls that each had their own
+     alloca+packing overhead. The reference DB is cached across calls. */
+  double *all_novelties = novelty_batch(features);
+
   for (i = 0; i < nr_class && i < MAX_FP_RESULTS; i++) {
     FPR->matches[i] = &o.os_labels_ipv6[labels[i].label];
     FPR->accuracy[i] = labels[i].prob;
@@ -1070,7 +1192,7 @@ static void classify(FingerPrintResultsIPv6 *FPR) {
       FPR->num_perfect_matches = i + 1;
     if (o.debugging > 2) {
       printf("%7.4f %7.4f %3u %s\n", FPR->accuracy[i] * 100,
-        novelty_of(features, labels[i].label), labels[i].label, FPR->matches[i]->OS_name);
+        all_novelties[labels[i].label], labels[i].label, FPR->matches[i]->OS_name);
     }
   }
   if (FPR->num_perfect_matches == 0) {
@@ -1078,7 +1200,7 @@ static void classify(FingerPrintResultsIPv6 *FPR) {
   } else if (FPR->num_perfect_matches == 1) {
     double novelty;
 
-    novelty = novelty_of(features, labels[0].label);
+    novelty = all_novelties[labels[0].label];
     if (o.debugging > 1)
       log_write(LOG_PLAIN, "Novelty of closest match is %.3f.\n", novelty);
 
@@ -1097,6 +1219,7 @@ static void classify(FingerPrintResultsIPv6 *FPR) {
     FPR->num_perfect_matches = 0;
   }
 
+  delete[] all_novelties;
   delete[] features;
   delete[] values;
   delete[] labels;

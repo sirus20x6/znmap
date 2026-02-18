@@ -76,6 +76,8 @@
 
 #include "struct_ip.h"
 
+#include "zig/pkt_builder.h"
+
 #if HAVE_NETINET_IF_ETHER_H
 #ifndef NETINET_IF_ETHER_H
 #include <netinet/if_ether.h>
@@ -727,6 +729,24 @@ int send_tcp_raw(int sd, const struct eth_nfo *eth,
   unsigned int packetlen;
   int res = -1;
 
+  /* Fast path: use zero-copy Zig packet builder when no IP/TCP options */
+  if (ipoptlen == 0 && optlen == 0) {
+    u8 pkt[1540];
+    int32_t pkt_len = pkt_build_tcp(
+        victim->s_addr, source->s_addr,
+        sport, dport, seq, ack, flags, window,
+        (const uint8_t *)data, (uint32_t)datalen,
+        pkt, sizeof(pkt));
+    if (pkt_len > 0) {
+      memset(&dst, 0, sizeof(dst));
+      dst_in = (struct sockaddr_in *) &dst;
+      dst_in->sin_family = AF_INET;
+      dst_in->sin_addr = *victim;
+      return send_ip_packet(sd, eth, &dst, pkt, (unsigned int)pkt_len);
+    }
+    /* Fall through to original path on error */
+  }
+
   u8 *packet = build_tcp_raw(source, victim,
                              ttl, get_random_u16(), IP_TOS_DEFAULT, df,
                              ipops, ipoptlen,
@@ -850,6 +870,25 @@ int send_udp_raw(int sd, const struct eth_nfo *eth,
   struct sockaddr_in *dst_in;
   unsigned int packetlen;
   int res = -1;
+
+  /* Fast path: use zero-copy Zig packet builder when no IP options */
+  if (ipoptlen == 0) {
+    u8 pkt[1540];
+    int32_t pkt_len = pkt_build_udp(
+        victim->s_addr, source->s_addr,
+        sport, dport,
+        (const uint8_t *)data, (uint32_t)datalen,
+        pkt, sizeof(pkt));
+    if (pkt_len > 0) {
+      memset(&dst, 0, sizeof(dst));
+      dst_in = (struct sockaddr_in *) &dst;
+      dst_in->sin_family = AF_INET;
+      dst_in->sin_addr = *victim;
+      return send_ip_packet(sd, eth, &dst, pkt, (unsigned int)pkt_len);
+    }
+    /* Fall through to original path on error */
+  }
+
   u8 *packet = build_udp_raw(source, victim,
                              ttl, ipid, IP_TOS_DEFAULT, false,
                              ipopt, ipoptlen,

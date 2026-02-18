@@ -402,6 +402,33 @@ void PortList::addScriptResult(u16 portno, int protocol, ScriptResult *sr) {
    (p)==PORTLIST_PROTO_SCTP ? IPPROTO_SCTP :	\
    IPPROTO_IP)
 
+/* Compact mapping of port states to 3-bit cache values (0-7).
+ * Value 0 is reserved as "unset" sentinel (use default state).
+ * This avoids the ambiguity where PORT_UNKNOWN=0 collided with "not cached". */
+static inline uint8_t portstate_encode(int state) {
+  switch (state) {
+    case PORT_OPEN:           return 1;
+    case PORT_CLOSED:         return 2;
+    case PORT_FILTERED:       return 3;
+    case PORT_UNFILTERED:     return 4;
+    case PORT_OPENFILTERED:   return 5;
+    case PORT_CLOSEDFILTERED: return 6;
+    default:                  return 0; /* unknown/unsupported — don't cache */
+  }
+}
+
+static inline int portstate_decode(uint8_t cached) {
+  switch (cached) {
+    case 1: return PORT_OPEN;
+    case 2: return PORT_CLOSED;
+    case 3: return PORT_FILTERED;
+    case 4: return PORT_UNFILTERED;
+    case 5: return PORT_OPENFILTERED;
+    case 6: return PORT_CLOSEDFILTERED;
+    default: return -1; /* sentinel: not cached */
+  }
+}
+
 
 PortList::PortList() {
   int proto;
@@ -501,8 +528,9 @@ void PortList::setPortState(u16 portno, u8 protocol, int state, int *oldstate) {
   }
 
   current->state = state;
-  int mapped = state < 8 ? state : 7;
-  portstate_set(portstate_cache[proto], portno, (uint8_t)mapped);
+  uint8_t encoded = portstate_encode(state);
+  if (encoded != 0)
+    portstate_set(portstate_cache[proto], portno, encoded);
   state_counts_proto[proto][state]++;
 
   if(state == PORT_FILTERED || state == PORT_OPENFILTERED)
@@ -513,7 +541,12 @@ void PortList::setPortState(u16 portno, u8 protocol, int state, int *oldstate) {
 int PortList::getPortState(u16 portno, u8 protocol) {
   int pidx = INPROTO2PORTLISTPROTO(protocol);
   uint8_t cached = portstate_get(portstate_cache[pidx], portno);
-  if (cached != 0 && cached < 7) return cached;
+  if (cached != 0) {
+    int decoded = portstate_decode(cached);
+    if (decoded >= 0)
+      return decoded;
+  }
+  /* Cache miss (0 = unset): fall back to Port struct or default */
   const Port *port;
   port = lookupPort(portno, protocol);
   if (port == NULL)
@@ -667,6 +700,8 @@ Port *PortList::createPort(u16 portno, u8 protocol, bool *created) {
 
 int PortList::forgetPort(u16 portno, u8 protocol) {
   Port *answer = NULL;
+  int proto_idx = INPROTO2PORTLISTPROTO(protocol);
+  u16 orig_portno = portno;
 
   log_write(LOG_PLAIN, "Removed %d\n", portno);
 
@@ -678,6 +713,9 @@ int PortList::forgetPort(u16 portno, u8 protocol) {
 
   state_counts_proto[protocol][answer->state]--;
   state_counts_proto[protocol][default_port_state[protocol].state]++;
+
+  /* Clear cache entry so getPortState falls back to default */
+  portstate_set(portstate_cache[proto_idx], orig_portno, 0);
 
   port_list[protocol][portno] = NULL;
 

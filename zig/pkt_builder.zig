@@ -406,3 +406,268 @@ export fn pkt_build_icmp(
 
     return @intCast(ip_total);
 }
+
+// ---------------------------------------------------------------------------
+// IPv6 packet construction
+// ---------------------------------------------------------------------------
+
+const IP6_HDR_LEN: u32 = 40;
+const IPPROTO_ICMPV6: u8 = 58;
+
+const DEFAULT_HOP_LIMIT: u8 = 64;
+
+/// Fill the 40-byte IPv6 header at buf[0..40].
+/// IPv6 has no header checksum.
+fn writeIp6Header(
+    buf: []u8, // must be >= 40 bytes
+    payload_len: u16, // length of everything after the 40-byte header
+    next_header: u8,
+    hop_limit: u8,
+    src_ip: *const [16]u8, // 128-bit address, network byte order
+    dst_ip: *const [16]u8, // 128-bit address, network byte order
+) void {
+    // Bytes 0-3: version(4)=6, traffic class(8)=0, flow label(20)=0
+    // 0110 0000 0000 0000 0000 0000 0000 0000 = 0x60000000
+    buf[0] = 0x60;
+    buf[1] = 0x00;
+    buf[2] = 0x00;
+    buf[3] = 0x00;
+    // Bytes 4-5: Payload Length (big-endian)
+    writeU16Be(buf, 4, payload_len);
+    // Byte 6: Next Header
+    buf[6] = next_header;
+    // Byte 7: Hop Limit
+    buf[7] = hop_limit;
+    // Bytes 8-23: Source Address
+    @memcpy(buf[8..24], src_ip);
+    // Bytes 24-39: Destination Address
+    @memcpy(buf[24..40], dst_ip);
+}
+
+/// Compute the IPv6 pseudo-header checksum contribution (RFC 2460 Section 8.1).
+/// Pseudo-header: src(16) + dst(16) + upper-layer-packet-length(4) + 3-zero-bytes + next-header(1) = 40 bytes.
+/// Returns the 64-bit running sum (not yet folded).
+fn pseudoHeader6Sum(src_ip: *const [16]u8, dst_ip: *const [16]u8, next_header: u8, transport_len: u32) u64 {
+    var ph: [40]u8 = undefined;
+    // Source address (16 bytes)
+    @memcpy(ph[0..16], src_ip);
+    // Destination address (16 bytes)
+    @memcpy(ph[16..32], dst_ip);
+    // Upper-layer packet length as u32 big-endian
+    writeU32Be(&ph, 32, transport_len);
+    // 3 zero bytes + next header
+    ph[36] = 0;
+    ph[37] = 0;
+    ph[38] = 0;
+    ph[39] = next_header;
+    return checksumAccumulate(&ph);
+}
+
+// ---------------------------------------------------------------------------
+// Exported C ABI functions — IPv6
+// ---------------------------------------------------------------------------
+
+/// Build a complete IPv6 + TCP packet into out_buf.
+///
+/// Parameters:
+///   dst_ip, src_ip   — pointers to 16-byte IPv6 addresses (network byte order,
+///                      i.e. in6_addr.s6_addr).
+///   sport, dport     — source/destination port in host byte order.
+///   seq, ack         — TCP sequence/acknowledgment in host byte order.
+///   flags            — TCP flags byte (TH_SYN etc.).
+///   window           — TCP window in host byte order (0 → 1024).
+///   payload, payload_len — application data (may be NULL/0).
+///   out_buf          — caller-supplied output buffer.
+///   out_len          — size of out_buf in bytes.
+///
+/// Returns total packet length on success, -1 if out_buf is too small.
+export fn pkt_build_tcp6(
+    dst_ip: *const [16]u8,
+    src_ip: *const [16]u8,
+    sport: u16,
+    dport: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    payload: ?[*]const u8,
+    payload_len: u32,
+    out_buf: [*]u8,
+    out_len: u32,
+) callconv(.c) i32 {
+    const tcp_total: u32 = TCP_HDR_LEN + payload_len;
+    const pkt_total: u32 = IP6_HDR_LEN + tcp_total;
+
+    if (out_len < pkt_total) return -1;
+
+    const buf = out_buf[0..pkt_total];
+
+    // --- IPv6 header ---
+    writeIp6Header(
+        buf[0..IP6_HDR_LEN],
+        @truncate(tcp_total),
+        IPPROTO_TCP,
+        DEFAULT_HOP_LIMIT,
+        src_ip,
+        dst_ip,
+    );
+
+    // --- TCP header at buf[40..60] ---
+    const th = buf[IP6_HDR_LEN..];
+    writeU16Be(th, 0, sport); // th_sport
+    writeU16Be(th, 2, dport); // th_dport
+    writeU32Be(th, 4, seq); // th_seq
+    writeU32Be(th, 8, ack); // th_ack
+    th[12] = 0x50; // data offset = 5 (20 bytes / 4), no reserved bits
+    th[13] = flags; // th_flags
+    const win: u16 = if (window != 0) window else DEFAULT_WINDOW;
+    writeU16Be(th, 14, win); // th_win
+    writeU16Be(th, 16, 0); // th_sum = 0 placeholder
+    writeU16Be(th, 18, 0); // th_urp = 0
+
+    // --- Payload copy ---
+    if (payload_len > 0) {
+        const pay = payload orelse return -1;
+        @memcpy(buf[IP6_HDR_LEN + TCP_HDR_LEN ..][0..payload_len], pay[0..payload_len]);
+    }
+
+    // --- TCP checksum: IPv6 pseudo-header + TCP header + payload ---
+    var sum: u64 = pseudoHeader6Sum(src_ip, dst_ip, IPPROTO_TCP, tcp_total);
+    sum += checksumAccumulate(buf[IP6_HDR_LEN..][0..tcp_total]);
+    const tcp_ck = finalizeChecksum(sum);
+    writeU16Be(th, 16, tcp_ck);
+
+    return @intCast(pkt_total);
+}
+
+/// Build a complete IPv6 + UDP packet into out_buf.
+///
+/// Parameters follow the same conventions as pkt_build_tcp6.
+/// Returns total packet length on success, -1 if out_buf is too small.
+/// UDP checksum of 0 is remapped to 0xFFFF per RFC 768 / RFC 2460.
+export fn pkt_build_udp6(
+    dst_ip: *const [16]u8,
+    src_ip: *const [16]u8,
+    sport: u16,
+    dport: u16,
+    payload: ?[*]const u8,
+    payload_len: u32,
+    out_buf: [*]u8,
+    out_len: u32,
+) callconv(.c) i32 {
+    const udp_total: u32 = UDP_HDR_LEN + payload_len;
+    const pkt_total: u32 = IP6_HDR_LEN + udp_total;
+
+    if (out_len < pkt_total) return -1;
+
+    const buf = out_buf[0..pkt_total];
+
+    // --- IPv6 header ---
+    writeIp6Header(
+        buf[0..IP6_HDR_LEN],
+        @truncate(udp_total),
+        IPPROTO_UDP,
+        DEFAULT_HOP_LIMIT,
+        src_ip,
+        dst_ip,
+    );
+
+    // --- UDP header at buf[40..48] ---
+    const uh = buf[IP6_HDR_LEN..];
+    writeU16Be(uh, 0, sport); // uh_sport
+    writeU16Be(uh, 2, dport); // uh_dport
+    writeU16Be(uh, 4, @truncate(udp_total)); // uh_ulen
+    writeU16Be(uh, 6, 0); // uh_sum = 0 placeholder
+
+    // --- Payload copy ---
+    if (payload_len > 0) {
+        const pay = payload orelse return -1;
+        @memcpy(buf[IP6_HDR_LEN + UDP_HDR_LEN ..][0..payload_len], pay[0..payload_len]);
+    }
+
+    // --- UDP checksum: IPv6 pseudo-header + UDP header + payload ---
+    // RFC 2460: UDP checksum is mandatory for IPv6 (no optional zero like IPv4).
+    // If computed checksum is 0, transmit as 0xFFFF.
+    var sum: u64 = pseudoHeader6Sum(src_ip, dst_ip, IPPROTO_UDP, udp_total);
+    sum += checksumAccumulate(buf[IP6_HDR_LEN..][0..udp_total]);
+    var udp_ck = finalizeChecksum(sum);
+    if (udp_ck == 0) udp_ck = 0xFFFF;
+    writeU16Be(uh, 6, udp_ck);
+
+    return @intCast(pkt_total);
+}
+
+/// Build a complete IPv6 + ICMPv6 packet into out_buf.
+///
+/// Supported type/code combinations:
+///   type=128, code=0 — Echo Request  (8-byte ICMPv6 header)
+///   type=129, code=0 — Echo Reply    (8-byte ICMPv6 header)
+///
+/// Unlike IPv4 ICMP, ICMPv6 checksum includes the IPv6 pseudo-header.
+///
+/// id, seq — ICMPv6 identifier/sequence in host byte order.
+/// Returns total packet length on success, -1 on error.
+export fn pkt_build_icmp6(
+    dst_ip: *const [16]u8,
+    src_ip: *const [16]u8,
+    icmp_type: u8,
+    code: u8,
+    id: u16,
+    seq: u16,
+    payload: ?[*]const u8,
+    payload_len: u32,
+    out_buf: [*]u8,
+    out_len: u32,
+) callconv(.c) i32 {
+    // ICMPv6 Echo Request (128) and Echo Reply (129) both have 8-byte headers:
+    //   type(1) + code(1) + checksum(2) + id(2) + seq(2)
+    const icmp_hdr_size: u32 = switch (icmp_type) {
+        128, 129 => 8,
+        else => return -1,
+    };
+
+    const icmp_total: u32 = icmp_hdr_size + payload_len;
+    const pkt_total: u32 = IP6_HDR_LEN + icmp_total;
+
+    if (out_len < pkt_total) return -1;
+
+    const buf = out_buf[0..pkt_total];
+
+    // --- IPv6 header ---
+    writeIp6Header(
+        buf[0..IP6_HDR_LEN],
+        @truncate(icmp_total),
+        IPPROTO_ICMPV6,
+        DEFAULT_HOP_LIMIT,
+        src_ip,
+        dst_ip,
+    );
+
+    // --- ICMPv6 header at buf[40..] ---
+    const ih = buf[IP6_HDR_LEN..];
+
+    // Zero out the entire ICMPv6 region first
+    @memset(ih[0..icmp_total], 0);
+
+    // Common fields: type, code, checksum(0), id, seq
+    ih[0] = icmp_type;
+    ih[1] = code;
+    writeU16Be(ih, 2, 0); // checksum placeholder
+    writeU16Be(ih, 4, id);
+    writeU16Be(ih, 6, seq);
+
+    // Payload appended after the ICMPv6 header
+    if (payload_len > 0) {
+        const pay = payload orelse return -1;
+        @memcpy(ih[icmp_hdr_size..][0..payload_len], pay[0..payload_len]);
+    }
+
+    // --- ICMPv6 checksum: pseudo-header + ICMPv6 header + payload ---
+    // Unlike IPv4 ICMP, ICMPv6 checksum includes the pseudo-header (RFC 4443).
+    var sum: u64 = pseudoHeader6Sum(src_ip, dst_ip, IPPROTO_ICMPV6, icmp_total);
+    sum += checksumAccumulate(ih[0..icmp_total]);
+    const icmp_ck = finalizeChecksum(sum);
+    writeU16Be(ih, 2, icmp_ck);
+
+    return @intCast(pkt_total);
+}
