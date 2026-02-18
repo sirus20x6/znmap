@@ -64,6 +64,7 @@
 
 
 #include "service_scan.h"
+#include "zig/probe_filter.h"
 #include "timing.h"
 #include "NmapOps.h"
 #include "nsock.h"
@@ -1103,6 +1104,7 @@ ServiceProbe::ServiceProbe() {
   notForPayload = false;
   fallbackStr = NULL;
   for (i=0; i<MAXFALLBACKS+1; i++) fallbacks[i] = NULL;
+  probeFilter = probe_filter_init();
 }
 
 ServiceProbe::~ServiceProbe() {
@@ -1112,6 +1114,7 @@ ServiceProbe::~ServiceProbe() {
     delete *vi;
   }
 
+  if (probeFilter) probe_filter_free(probeFilter);
   if (fallbackStr) free(fallbackStr);
 }
 
@@ -1302,6 +1305,16 @@ void ServiceProbe::addMatch(const char *match, int lineno) {
   sname = newmatch->getName();
   if (!serviceIsPossible(sname))
     detectedServices.push_back(sname);
+
+  // Register the regex with the Zig pre-filter
+  if (probeFilter && newmatch->getMatchStr()) {
+    unsigned int idx = (unsigned int) matches.size();
+    probe_filter_add(probeFilter, idx,
+                     (const unsigned char *) newmatch->getMatchStr(),
+                     strlen(newmatch->getMatchStr()),
+                     newmatch->getIgnoreCase() ? 1 : 0);
+  }
+
   matches.push_back(newmatch);
 }
 
@@ -1460,11 +1473,13 @@ int AllProbes::check_excluded_port(unsigned short portno, int proto)
 // no version matched, that field will be NULL. This function may
 // return NULL if there are no match lines at all in this probe.
 const struct MatchDetails *ServiceProbe::testMatch(const u8 *buf, int buflen, int n = 0) {
-  std::vector<ServiceProbeMatch *>::iterator vi;
   const struct MatchDetails *MD;
 
-  for(vi = matches.begin(); vi != matches.end(); vi++) {
-    MD = (*vi)->testMatch(buf, buflen);
+  for(unsigned int i = 0; i < matches.size(); i++) {
+    // Zig pre-filter: skip patterns whose literal prefix isn't in the buffer
+    if (probeFilter && !probe_filter_check(probeFilter, i, buf, buflen))
+      continue;
+    MD = matches[i]->testMatch(buf, buflen);
     if (MD->serviceName) {
       if (n == 0)
         return MD;

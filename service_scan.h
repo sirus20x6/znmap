@@ -147,6 +147,8 @@ class ServiceProbeMatch {
   // The Line number where this match string was defined.  Returns
   // -1 if unknown.
   int getLineNo() const { return deflineno; }
+  const char *getMatchStr() const { return matchstr; }
+  bool getIgnoreCase() const { return matchops_ignorecase; }
  private:
   int deflineno; // The line number where this match is defined.
   bool isInitialized; // Has InitMatch yet been called?
@@ -286,6 +288,7 @@ class ServiceProbe {
   std::vector<const char *> detectedServices;
   int probeprotocol;
   std::vector<ServiceProbeMatch *> matches; // first-ever use of STL in Nmap!
+  void *probeFilter; // Zig-based pre-filter for skipping non-matching PCRE2 calls
 };
 
 class AllProbes {

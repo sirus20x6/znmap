@@ -115,7 +115,7 @@ export HDRS = charpool.h FingerPrintResults.h FPEngine.h idle_scan.h MACLookup.h
 OBJS = charpool.o FingerPrintResults.o FPEngine.o FPModel.o idle_scan.o MACLookup.o nmap_dns.o nmap_error.o nmap.o nmap_ftp.o NmapOps.o NmapOutputTable.o nmap_tty.o osscan2.o osscan.o output.o payload.o portlist.o portreasons.o protocols.o scan_engine.o scan_engine_connect.o scan_engine_raw.o scan_lists.o service_scan.o services.o string_pool.o NewTargets.o TargetGroup.o Target.o targets.o tcpip.o timing.o traceroute.o utils.o xml.o $(NSE_OBJS)
 
 # Zig-optimized object files (override C implementations at link time)
-ZIG_OBJS = zig/checksum.o
+ZIG_OBJS = zig/checksum.o zig/probe_filter.o
 
 # %.o : %.cc -- nope this is a GNU extension
 .cc.o:
@@ -129,6 +129,9 @@ FPModel.o: CXXFLAGS += -g0
 # Zig object compilation rules
 zig/checksum.o: zig/checksum.zig
 	zig build-obj -OReleaseFast $< --name checksum 2>&1 && mv checksum.o $@
+
+zig/probe_filter.o: zig/probe_filter.zig
+	zig build-obj -OReleaseFast -lc $< --name probe_filter 2>&1 && mv probe_filter.o $@
 
 all: $(TARGET) $(BUILDZENMAP) $(BUILDNDIFF) $(BUILDNPING) $(BUILDNCAT)
 
