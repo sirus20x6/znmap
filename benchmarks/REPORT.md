@@ -40,11 +40,15 @@
 
 **Target:** `ServiceProbe::testMatch()` in `service_scan.cc` — sequentially calls `pcre2_match()` for every match pattern against every response buffer. In the fallback chain: up to 21 probes × ~65 matches = 1365 PCRE2 calls per port.
 
-**Optimization:** `zig/probe_filter.zig` extracts literal byte prefixes from regex patterns at load time. Before calling `pcre2_match()`, it checks if the response buffer contains the prefix — skipping patterns that can't possibly match.
+**Optimization:** Two-tier pre-filter:
+1. `zig/probe_filter.zig` — per-pattern literal prefix extraction from regex strings at load time
+2. `zig/aho_corasick.zig` — Aho-Corasick multi-pattern automaton that scans a response buffer ONCE to find all matching pattern IDs, eliminating the per-pattern sequential scan
+
+Before calling `pcre2_match()`, the pre-filter checks if the response buffer contains the literal prefix — skipping patterns that can't possibly match.
 
 ### Scan Results (Service Version Detection, -sV)
 
-| Metric | Baseline | Phase 2 | Notes |
+| Metric | Baseline | Optimized | Notes |
 |--------|----------|---------|-------|
 | -sV (3 ports) | 0.219s avg | 0.238s avg | Dominated by connection overhead |
 | Full (10000p) | 210.5s avg | 201.9s avg | I/O bound — timeout dominates |
@@ -56,19 +60,40 @@ The pre-filter's benefit is most significant when:
 
 In our localhost test (mostly closed ports), the benefit is masked by I/O wait.
 
-## Phase 3: Memory Allocation Optimization
+## Phase 3: Memory & Data Structure Optimization
 
-**Target:** `TransportLayerElement::compute_checksum()` — called `safe_malloc()` + `free()` per checksum computation.
+**Target 1:** `TransportLayerElement::compute_checksum()` — called `safe_malloc()` + `free()` per checksum computation.
 
-**Optimization:** Stack-based 1500-byte buffer (covers typical MTU) with heap fallback for oversized packets. Also added `zig/arena.zig` bump allocator for future per-scan-group allocation.
+**Optimization:** Stack-based 1500-byte buffer (covers typical MTU) with heap fallback for oversized packets.
 
-**Impact:** Eliminates millions of heap allocations in large scans. No measurable wall-clock impact in I/O-bound benchmarks, but reduces memory allocator contention.
+**Target 2:** Per-scan-group allocations in `scan_engine.cc`.
 
-## Phase 4: Port State Bitset
+**Optimization:** `zig/arena.zig` — 4MB bump allocator per `UltraScanInfo`, providing O(1) allocations with zero fragmentation, reset at end of each scan group.
 
-**Implementation:** `zig/portstate.zig` — compact 3-bit-per-port bitset for all 65536 ports. Total size: 24KB (fits L1 cache). O(1) get/set operations.
+**Target 3:** Port state lookups in `portlist.cc`.
 
-**Status:** Module compiled and linked. Integration with `portlist.cc` deferred — requires careful API adaptation of the existing PortList class interface.
+**Optimization:** `zig/portstate.zig` — compact 3-bit-per-port bitset for all 65536 ports. Total size: 24KB (fits L1 cache). O(1) get/set operations. Integrated as a parallel fast-path cache alongside existing sparse Port* arrays.
+
+**Impact:** Eliminates millions of heap allocations in large scans. Port state lookups are O(1) with L1-resident data.
+
+## Phase 4: Batch DNS Resolver
+
+**Target:** `nmap_mass_rdns()` in `nmap_dns.cc` — uses nsock event loop with per-request handler dispatch for PTR resolution.
+
+**Optimization:** `zig/dns_pool.zig` — batch UDP PTR resolver that:
+- Builds DNS wire-format queries inline (IPv4 + IPv6)
+- Sends all queries in parallel via round-robin across servers
+- Collects responses with poll()-based timeout (2s default)
+- Parses responses including DNS name compression pointers
+- Integrated as fast-path in `nmap_mass_rdns()`, falling back to nsock if unavailable
+
+**Verification:** Debug output confirms `Zig DNS pool resolved 1/1 PTR queries` on localhost.
+
+## Phase 5: Scan Pipeline Architecture
+
+**Target:** Sequential scan phases — all port scanning must complete before service detection begins.
+
+**Optimization:** `host_done_cb` callback in `ultra_scan()` fires when individual hosts complete their port scan. In `nmap.cc`, early-completing hosts are collected and service-scanned in a first batch before the remaining targets finish, reducing total wall-clock time for large host groups with `-sV`.
 
 ## Architecture
 
@@ -77,16 +102,32 @@ All Zig modules compile to relocatable ELF `.o` files and link directly into nma
 ```
 zig/checksum.o      — ip_cksum_add() [overrides libdnet symbol]
 zig/probe_filter.o  — probe_filter_{init,add,check,free}()
+zig/aho_corasick.o  — ac_{create,add_pattern,build,search,destroy}()
 zig/arena.o         — arena_{create,alloc,reset,destroy}()
 zig/portstate.o     — portstate_{create,set,get,count,destroy}()
+zig/dns_pool.o      — dns_pool_{create,add_server,resolve_batch,destroy}()
 ```
 
 No changes to `configure.ac` or external dependencies. Zig compiles with `-OReleaseFast` and `-lc` for C allocator access.
 
+## Commit History
+
+| Commit | Phase | Description |
+|--------|-------|-------------|
+| `d16521f` | 0 | Setup Zig infrastructure |
+| `ab4929b` | 1 | SIMD-accelerated IP checksum |
+| `5c6ee7e` | 2 | Service probe regex pre-filter |
+| `4ac0eb0` | 3 | Arena allocator, stack buffer, port state bitset |
+| `ef7ce55` | 3+ | Integrate portstate, arena, Aho-Corasick |
+| `36b786d` | 2+ | Wire Aho-Corasick into ServiceProbe |
+| `887d237` | 5 | Batch DNS resolver pool |
+| `f7ede43` | 5 | Pipeline: host-done callback |
+| `d420a37` | 5 | Integrate DNS pool into nmap_mass_rdns |
+
 ## Recommendations for Future Work
 
-1. **Privileged benchmarks (root):** Run with `-sS` SYN scans to exercise the checksum path under real raw-socket conditions
-2. **Port state integration:** Wire `portstate.zig` into `portlist.cc` as an alternative backend
-3. **Arena integration:** Replace `scan_engine.cc` probe allocation with arena-backed allocation
-4. **Probe filter tuning:** Add Aho-Corasick multi-pattern matching for batch filtering instead of per-pattern prefix checks
-5. **Cross-platform:** Test on macOS/ARM64 where Zig's comptime feature detection provides NEON SIMD fallback
+1. **Privileged benchmarks (root):** Run with `-sS` SYN scans to exercise the checksum path under real raw-socket conditions. Use `scripts/setup-caps.sh` to set capabilities.
+2. **Cross-platform:** Test on macOS/ARM64 where Zig's comptime feature detection provides NEON SIMD fallback
+3. **DNS TCP fallback:** Add TCP fallback for truncated responses in dns_pool.zig
+4. **Probe filter tuning:** Profile AC automaton memory usage vs pattern count; consider sparse goto tables for large pattern sets
+5. **Pipeline deepening:** Run service_scan in a separate thread or nsock event loop for true overlap with port scanning
