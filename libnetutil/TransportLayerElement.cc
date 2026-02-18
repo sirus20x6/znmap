@@ -97,6 +97,9 @@ u16 TransportLayerElement::compute_checksum(){
   PacketElement *hdr;
   hdr=this->getPrevElement();
   u16 final_sum=0;
+  u8 stack_buf[1500];
+  u8 *buff;
+  size_t len = this->getLen();
   /* Traverse the list of headers backwards until we find an IP header */
   while(hdr!=NULL){
       if (hdr->protocol_id()==HEADER_TYPE_IPv6){
@@ -104,20 +107,22 @@ u16 TransportLayerElement::compute_checksum(){
             struct in6_addr i6src, i6dst;
             memcpy(i6src.s6_addr, v6hdr->getSourceAddress(), 16);
             memcpy(i6dst.s6_addr, v6hdr->getDestinationAddress(), 16);
-            u8 *buff=(u8 *)safe_malloc(this->getLen());
-            this->dumpToBinaryBuffer(buff, this->getLen());
-            final_sum=ipv6_pseudoheader_cksum(&i6src, &i6dst, this->protocol_id(), this->getLen(), buff);
-            free(buff);
+            if (len <= sizeof(stack_buf)) buff = stack_buf;
+            else buff = (u8 *)safe_malloc(len);
+            this->dumpToBinaryBuffer(buff, len);
+            final_sum=ipv6_pseudoheader_cksum(&i6src, &i6dst, this->protocol_id(), len, buff);
+            if (buff != stack_buf) free(buff);
             return final_sum;
       }else if(hdr->protocol_id()==HEADER_TYPE_IPv4){
             IPv4Header *v4hdr=(IPv4Header *)hdr;
             struct in_addr i4src, i4dst;
             memcpy(&(i4src.s_addr), v4hdr->getSourceAddress(), 4);
             memcpy(&(i4dst.s_addr), v4hdr->getDestinationAddress(), 4);
-            u8 *buff=(u8 *)safe_malloc(this->getLen());
-            this->dumpToBinaryBuffer(buff, this->getLen());
-            final_sum=ipv4_pseudoheader_cksum(&i4src, &i4dst, this->protocol_id(), this->getLen(), buff);
-            free(buff);
+            if (len <= sizeof(stack_buf)) buff = stack_buf;
+            else buff = (u8 *)safe_malloc(len);
+            this->dumpToBinaryBuffer(buff, len);
+            final_sum=ipv4_pseudoheader_cksum(&i4src, &i4dst, this->protocol_id(), len, buff);
+            if (buff != stack_buf) free(buff);
             return final_sum;
       }else{
           hdr=hdr->getPrevElement();
