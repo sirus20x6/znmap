@@ -703,6 +703,22 @@ u8 *build_tcp_raw_ipv6(const struct in6_addr *source,
                        u8 reserved, u8 flags, u16 window, u16 urp,
                        const u8 *tcpopt, int tcpoptlen, const char *data,
                        u16 datalen, u32 *packetlen) {
+  /* Fast path: use Zig packet builder when no TCP options and default tc/flow */
+  if (tcpoptlen == 0 && tc == 0 && flowlabel == 0) {
+    u8 *buf = (u8 *) safe_malloc(1540);
+    int32_t pkt_len = pkt_build_tcp6(
+        (const uint8_t *)victim->s6_addr, (const uint8_t *)source->s6_addr,
+        sport, dport, seq, ack, flags, window,
+        (const uint8_t *)data, (uint32_t)datalen,
+        buf, 1540);
+    if (pkt_len > 0) {
+      *packetlen = (u32)pkt_len;
+      return buf;
+    }
+    free(buf);
+    /* Fall through to original path on error */
+  }
+
   struct tcp_hdr *tcp;
   u32 tcplen;
   u8 *ipv6;
@@ -848,6 +864,22 @@ u8 *build_udp_raw_ipv6(const struct in6_addr *source,
                        const struct in6_addr *victim, u8 tc, u32 flowlabel,
                        u8 hoplimit, u16 sport, u16 dport,
                        const char *data, u16 datalen, u32 *packetlen) {
+  /* Fast path: use Zig packet builder when default tc/flow */
+  if (tc == 0 && flowlabel == 0) {
+    u8 *buf = (u8 *) safe_malloc(1540);
+    int32_t pkt_len = pkt_build_udp6(
+        (const uint8_t *)victim->s6_addr, (const uint8_t *)source->s6_addr,
+        sport, dport,
+        (const uint8_t *)data, (uint32_t)datalen,
+        buf, 1540);
+    if (pkt_len > 0) {
+      *packetlen = (u32)pkt_len;
+      return buf;
+    }
+    free(buf);
+    /* Fall through to original path on error */
+  }
+
   struct udp_hdr *udp;
   u32 udplen;
   u8 *ipv6;
@@ -1077,6 +1109,22 @@ u8 *build_icmpv6_raw(const struct in6_addr *source,
                      const struct in6_addr *victim, u8 tc, u32 flowlabel,
                      u8 hoplimit, u16 seq, u16 id, u8 ptype, u8 pcode,
                      const char *data, u16 datalen, u32 *packetlen) {
+  /* Fast path: use Zig packet builder when default tc/flow */
+  if (tc == 0 && flowlabel == 0) {
+    u8 *buf = (u8 *) safe_malloc(1540);
+    int32_t pkt_len = pkt_build_icmp6(
+        (const uint8_t *)victim->s6_addr, (const uint8_t *)source->s6_addr,
+        ptype, pcode, id, seq,
+        (const uint8_t *)data, (uint32_t)datalen,
+        buf, 1540);
+    if (pkt_len > 0) {
+      *packetlen = (u32)pkt_len;
+      return buf;
+    }
+    free(buf);
+    /* Fall through to original path on error */
+  }
+
   char *packet;
   struct icmpv6_hdr *icmpv6;
   union icmpv6_msg *msg;

@@ -90,6 +90,7 @@
 #include "xml.h"
 #include "scan_lists.h"
 #include "payload.h"
+#include "multicast_discovery.h"
 
 #ifndef NOLUA
 #include "nse_main.h"
@@ -749,6 +750,7 @@ void parse_options(int argc, char **argv) {
     {"route-dst", required_argument, 0, 0},
     {"resume", required_argument, 0, 0},
     {"no-nmaprc", no_argument, 0, 0},
+    {"multicast-discovery", no_argument, 0, 0},
     {0, 0, 0, 0}
   };
 
@@ -934,6 +936,8 @@ void parse_options(int argc, char **argv) {
             fatal("Invalid proxy chain specification");
         } else if (strcmp(long_options[option_index].name, "discovery-ignore-rst") == 0) {
             o.discovery_ignore_rst = true;
+        } else if (strcmp(long_options[option_index].name, "multicast-discovery") == 0) {
+            o.multicast_discovery = true;
         } else if (strcmp(long_options[option_index].name, "osscan-limit")  == 0) {
           o.osscan_limit = true;
         } else if (strcmp(long_options[option_index].name, "osscan-guess")  == 0
@@ -2127,6 +2131,17 @@ int nmap_main(int argc, char *argv[]) {
   if (delayed_options.iflist) {
     print_iflist();
     exit(0);
+  }
+
+  /* IPv6 all-nodes multicast discovery (standalone mode) */
+  if (o.multicast_discovery) {
+    const char *dev = o.device[0] ? o.device : NULL;
+    std::vector<struct sockaddr_storage> mcast_hosts = do_multicast_discovery(dev);
+    if (mcast_hosts.empty()) {
+      log_write(LOG_STDOUT, "No hosts discovered via multicast.\n");
+    }
+    /* This is a standalone discovery mode; exit after completion
+       unless the user also specified scan targets. */
   }
 
   /* If he wants to bounce off of an FTP site, that site better damn well be reachable! */

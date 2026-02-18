@@ -311,6 +311,7 @@ class NmapOps {
 
   nsock_proxychain proxy_chain;
   bool discovery_ignore_rst; /* host discovery should not consider TCP RST packet responses as a live asset */
+  bool multicast_discovery; /* --multicast-discovery: send ICMPv6 Echo to ff02::1 for link-local enumeration */
 
 #ifndef NOLUA
   bool script;
