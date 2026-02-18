@@ -1,0 +1,10 @@
+# Udev rule to set nmap capabilities after install.
+# Install: sudo cp scripts/99-nmap-caps.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload-rules
+#
+# Note: udev rules trigger on device events, not binary installs.
+# This rule grants /dev/net/tun access to the 'nmap' group for tunnel scans.
+# For raw socket capabilities, use: sudo scripts/setup-caps.sh
+
+# Allow members of the 'nmap' group to use /dev/net/tun without sudo
+KERNEL=="tun", GROUP="nmap", MODE="0660"
