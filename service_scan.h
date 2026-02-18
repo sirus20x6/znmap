@@ -289,6 +289,8 @@ class ServiceProbe {
   int probeprotocol;
   std::vector<ServiceProbeMatch *> matches; // first-ever use of STL in Nmap!
   void *probeFilter; // Zig-based pre-filter for skipping non-matching PCRE2 calls
+  void *acAutomaton; // Aho-Corasick automaton for batch pattern matching
+  bool acBuilt;      // Whether ac_build() has been called
 };
 
 class AllProbes {

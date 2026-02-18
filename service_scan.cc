@@ -65,6 +65,7 @@
 
 #include "service_scan.h"
 #include "zig/probe_filter.h"
+#include "zig/aho_corasick.h"
 #include "timing.h"
 #include "NmapOps.h"
 #include "nsock.h"
@@ -1105,6 +1106,8 @@ ServiceProbe::ServiceProbe() {
   fallbackStr = NULL;
   for (i=0; i<MAXFALLBACKS+1; i++) fallbacks[i] = NULL;
   probeFilter = probe_filter_init();
+  acAutomaton = ac_create();
+  acBuilt = false;
 }
 
 ServiceProbe::~ServiceProbe() {
@@ -1115,6 +1118,7 @@ ServiceProbe::~ServiceProbe() {
   }
 
   if (probeFilter) probe_filter_free(probeFilter);
+  if (acAutomaton) ac_destroy(acAutomaton);
   if (fallbackStr) free(fallbackStr);
 }
 
