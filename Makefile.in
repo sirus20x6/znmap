@@ -115,7 +115,7 @@ export HDRS = charpool.h FingerPrintResults.h FPEngine.h idle_scan.h MACLookup.h
 OBJS = charpool.o FingerPrintResults.o FPEngine.o FPModel.o idle_scan.o MACLookup.o nmap_dns.o nmap_error.o nmap.o nmap_ftp.o NmapOps.o NmapOutputTable.o nmap_tty.o osscan2.o osscan.o output.o payload.o portlist.o portreasons.o protocols.o scan_engine.o scan_engine_connect.o scan_engine_raw.o scan_lists.o service_scan.o services.o string_pool.o NewTargets.o TargetGroup.o Target.o targets.o tcpip.o timing.o traceroute.o utils.o xml.o $(NSE_OBJS)
 
 # Zig-optimized object files (override C implementations at link time)
-ZIG_OBJS = zig/checksum.o zig/probe_filter.o zig/arena.o zig/portstate.o zig/aho_corasick.o zig/dns_pool.o
+ZIG_OBJS = zig/checksum.o zig/probe_filter.o zig/arena.o zig/portstate.o zig/aho_corasick.o zig/dns_pool.o zig/fp_match.o zig/pkt_builder.o
 
 # %.o : %.cc -- nope this is a GNU extension
 .cc.o:
@@ -144,6 +144,12 @@ zig/aho_corasick.o: zig/aho_corasick.zig
 
 zig/dns_pool.o: zig/dns_pool.zig
 	zig build-obj -OReleaseFast -lc $< --name dns_pool 2>&1 && mv dns_pool.o $@
+
+zig/fp_match.o: zig/fp_match.zig
+	zig build-obj -OReleaseFast -lc $< --name fp_match 2>&1 && mv fp_match.o $@
+
+zig/pkt_builder.o: zig/pkt_builder.zig
+	zig build-obj -OReleaseFast -lc $< --name pkt_builder 2>&1 && mv pkt_builder.o $@
 
 all: $(TARGET) $(BUILDZENMAP) $(BUILDNDIFF) $(BUILDNPING) $(BUILDNCAT)
 

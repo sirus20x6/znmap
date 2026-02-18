@@ -138,6 +138,9 @@
 #include <string>
 #include <sstream>
 #include <vector>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 
 /* global options */
 extern char *optarg;
@@ -1840,11 +1843,56 @@ void nmap_free_mem() {
   nsock_set_default_engine(NULL);
 }
 
-/* Pipeline callback: collects a Target pointer into a vector when a host
-   finishes its port scan, enabling early service detection. */
-static void collect_early_target(Target *t, void *data) {
-  static_cast<std::vector<Target *> *>(data)->push_back(t);
-}
+/* ScanPipeline: overlaps port scanning and service detection.
+   A worker thread runs service_scan() on each batch of hosts that finish
+   their port scan while ultra_scan() continues working on the rest. */
+struct ScanPipeline {
+  std::mutex mtx;
+  std::condition_variable cv;
+  std::vector<Target *> ready_targets; // hosts done with port scan
+  bool port_scan_done;                 // signal that ultra_scan finished
+
+  ScanPipeline() : port_scan_done(false) {}
+
+  /* ultra_scan host_done_cb: push the completed host and wake the worker. */
+  static void on_host_done(Target *t, void *data) {
+    ScanPipeline *pipe = static_cast<ScanPipeline *>(data);
+    {
+      std::lock_guard<std::mutex> lk(pipe->mtx);
+      pipe->ready_targets.push_back(t);
+    }
+    pipe->cv.notify_one();
+  }
+
+  /* Worker thread: drain ready_targets in batches and call service_scan(). */
+  static void worker_func(ScanPipeline *pipe) {
+    std::vector<Target *> batch;
+    for (;;) {
+      {
+        std::unique_lock<std::mutex> lk(pipe->mtx);
+        pipe->cv.wait(lk, [pipe] {
+          return !pipe->ready_targets.empty() || pipe->port_scan_done;
+        });
+        batch.swap(pipe->ready_targets);
+      }
+      if (!batch.empty()) {
+        if (o.verbose)
+          log_write(LOG_STDOUT,
+                    "Pipeline: service scanning %lu host%s in worker thread\n",
+                    (unsigned long)batch.size(),
+                    batch.size() == 1 ? "" : "s");
+        service_scan(batch);
+        batch.clear();
+      }
+      /* Check again under lock: stop only when done AND queue drained. */
+      {
+        std::lock_guard<std::mutex> lk(pipe->mtx);
+        if (pipe->port_scan_done && pipe->ready_targets.empty())
+          return;
+      }
+    }
+  }
+};
 
 int nmap_main(int argc, char *argv[]) {
   int i;
@@ -2219,17 +2267,26 @@ int nmap_main(int argc, char *argv[]) {
     /* I now have the group for scanning in the Targets vector */
 
     if (!o.noportscan) {
-      /* When service detection (-sV) is also requested, collect hosts that
-         finish their port scan early so we can start version detection on
-         them before the entire group finishes.  This "pipeline" reduces
-         total scan time for large host groups. */
-      std::vector<Target *> early_sv_targets;
-      host_done_cb sv_cb = NULL;
-      void *sv_cb_data = NULL;
-      if (o.servicescan && Targets.size() > 1) {
-        sv_cb = collect_early_target;
-        sv_cb_data = &early_sv_targets;
+      /* When service detection (-sV) is requested with multiple hosts, spin up
+         a worker thread that calls service_scan() on each host as soon as its
+         port scan completes, overlapping port scanning and service detection.
+         For a single host there is nothing to overlap, so fall back to the
+         simple sequential path. */
+      const bool use_pipeline = o.servicescan && Targets.size() > 1;
+      ScanPipeline pipe;
+      std::thread sv_worker;
+
+      if (use_pipeline) {
+        o.current_scantype = SERVICE_SCAN;
+        sv_worker = std::thread(ScanPipeline::worker_func, &pipe);
       }
+
+      /* Determine which ultra_scan call is "last" for TCP scans so that we
+         only attach the callback to the one whose completions feed the worker.
+         SYN and connect scans are the primary TCP scan types; we attach the
+         callback to whichever fires last. */
+      host_done_cb sv_cb      = use_pipeline ? ScanPipeline::on_host_done : NULL;
+      void        *sv_cb_data = use_pipeline ? &pipe                       : NULL;
 
       // Ultra_scan sets o.scantype for us so we don't have to worry
       if (o.synscan)
@@ -2288,27 +2345,19 @@ int nmap_main(int argc, char *argv[]) {
         }
       }
 
-      if (o.servicescan) {
-        o.current_scantype = SERVICE_SCAN;
-        /* Pipeline: if some hosts completed early during port scanning,
-           service-scan them first as a batch, then handle the rest. */
-        if (!early_sv_targets.empty() && early_sv_targets.size() < Targets.size()) {
-          if (o.verbose)
-            log_write(LOG_STDOUT, "Pipeline: service scanning %lu early-completed hosts\n",
-                      (unsigned long)early_sv_targets.size());
-          service_scan(early_sv_targets);
-          /* Now service-scan the remaining targets that weren't early */
-          std::set<Target *> early_set(early_sv_targets.begin(), early_sv_targets.end());
-          std::vector<Target *> remaining;
-          for (size_t i = 0; i < Targets.size(); i++) {
-            if (early_set.find(Targets[i]) == early_set.end())
-              remaining.push_back(Targets[i]);
-          }
-          if (!remaining.empty())
-            service_scan(remaining);
-        } else {
-          service_scan(Targets);
+      if (use_pipeline) {
+        /* Signal the worker that port scanning is done, then wait for it to
+           drain any remaining targets and finish service_scan(). */
+        {
+          std::lock_guard<std::mutex> lk(pipe.mtx);
+          pipe.port_scan_done = true;
         }
+        pipe.cv.notify_one();
+        sv_worker.join();
+      } else if (o.servicescan) {
+        /* Single-host (or no-pipeline) path: plain sequential service scan. */
+        o.current_scantype = SERVICE_SCAN;
+        service_scan(Targets);
       }
     }
 

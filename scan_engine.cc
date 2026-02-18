@@ -402,6 +402,18 @@ bool GroupScanStats::sendOK(struct timeval *when) const {
     return true;
   }
 
+  /* If --min-rate is set, do not let per-host congestion throttling prevent
+     the group from honouring the requested minimum send rate.  When the cwnd
+     is exhausted but we are at or past the scheduled send time, return true
+     so that at least one host can still fire a probe.  This keeps a lossy
+     host's reduced cwnd from dragging the entire group below --min-rate. */
+  if (o.min_packet_send_rate != 0.0 &&
+      !TIMEVAL_AFTER(send_no_later_than, USI->now)) {
+    if (when)
+      *when = USI->now;
+    return true;
+  }
+
   return false;
 }
 
@@ -1632,8 +1644,35 @@ static void ultrascan_adjust_timing(UltraScanInfo *USI, HostScanStats *hss,
     // Drops often come in big batches, but we only want one decrease per batch.
     if (TIMEVAL_AFTER(probe->sent, hss->timing.last_drop))
       hss->timing.drop(hss->num_probes_active, &USI->perf, &USI->now);
-    if (TIMEVAL_AFTER(probe->sent, USI->gstats->timing.last_drop))
-      USI->gstats->timing.drop_group(USI->gstats->num_probes_active, &USI->perf, &USI->now);
+    /* Only penalise the group cwnd when drops are widespread across hosts,
+       not just isolated to one slow/lossy host.  We count how many incomplete
+       hosts have experienced a drop since the last group-level drop event;
+       if that fraction exceeds 50 % we treat it as a network-wide signal and
+       call drop_group().  With a single host in flight (or with --nogcc) we
+       always propagate, matching the previous behaviour. */
+    if (TIMEVAL_AFTER(probe->sent, USI->gstats->timing.last_drop)) {
+      bool apply_group_drop = true;
+      unsigned int num_incomplete = USI->numIncompleteHosts();
+      if (!o.nogcc && num_incomplete >= 2) {
+        unsigned int hosts_dropped = 0;
+        for (auto hi = USI->incompleteHosts.begin();
+             hi != USI->incompleteHosts.end(); hi++) {
+          /* A host counts as "currently dropping" if its own last_drop
+             timestamp is more recent than the group's last_drop — meaning
+             it has had a per-host drop since the last group-level event. */
+          if (TIMEVAL_AFTER((*hi)->timing.last_drop,
+                            USI->gstats->timing.last_drop))
+            hosts_dropped++;
+        }
+        /* Require more than half of all incomplete hosts to be dropping
+           before we reduce the group congestion window. */
+        if (hosts_dropped * 2 <= num_incomplete)
+          apply_group_drop = false;
+      }
+      if (apply_group_drop)
+        USI->gstats->timing.drop_group(USI->gstats->num_probes_active,
+                                       &USI->perf, &USI->now);
+    }
   }
   /* If !probe->isPing() and rcvdtime == NULL, do nothing. */
 
@@ -1730,9 +1769,22 @@ void HostScanStats::getTiming(struct ultra_timing_vals *tmng) const {
     return;
   }
 
-  /* Otherwise, use the global cwnd stats if it has sufficient responses */
+  /* If this host has received at least one response, trust its own timing
+     data exclusively.  This prevents a responsive host from being throttled
+     by a lossy neighbour's contribution to the group cwnd. */
+  if (timing.num_replies_received > 0) {
+    *tmng = timing;
+    return;
+  }
+
+  /* Host has received zero responses.  Rather than blindly deferring to the
+     group cwnd (which a 100%-loss host would drag down via drop_group()),
+     use the host's own cwnd but impose a floor of half the group cwnd.
+     This keeps a permanently silent host from dragging group throughput to
+     the minimum congestion window. */
   if (USI->gstats->timing.num_updates > 1) {
-    *tmng = USI->gstats->timing;
+    *tmng = timing;
+    tmng->cwnd = MAX(timing.cwnd, USI->gstats->timing.cwnd * 0.5);
     return;
   }
 

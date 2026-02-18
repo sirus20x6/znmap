@@ -2,7 +2,9 @@
 //
 // Provides a connection-pooled PTR resolver for nmap's mass reverse DNS.
 // Sends batches of queries across multiple UDP sockets, collects responses
-// with poll()-based timeout.
+// with poll()-based timeout.  When a UDP response has the TC (truncation)
+// bit set, the query is automatically retried over TCP with a 2-byte length
+// prefix as specified in RFC 1035 §4.2.2.
 //
 // C ABI exports:
 //   dns_pool_create(max_servers)
@@ -18,6 +20,7 @@ const posix = std.posix;
 const DNS_HDR_SIZE = 12;
 const MAX_NAME_LEN = 255;
 const MAX_PACKET = 512;
+const MAX_TCP_PACKET = 65535; // RFC 1035 §4.2.2 — TCP allows full 16-bit length
 const MAX_SERVERS = 8;
 const MAX_BATCH = 4096;
 
@@ -231,6 +234,115 @@ fn parsePtrResponse(pkt: []const u8, out_hostname: *[256]u8) ?u16 {
     return null;
 }
 
+// ===================== TCP Fallback =====================
+
+/// Perform a TCP DNS query to the given server, using the already-built UDP
+/// query packet.  The TCP wire format wraps the DNS message in a 2-byte
+/// big-endian length prefix (RFC 1035 §4.2.2).
+///
+/// `remaining_ms` — milliseconds left from the overall batch deadline.
+/// Returns a heap-allocated slice (c_allocator) containing the raw DNS
+/// response (without the 2-byte TCP length prefix), or null on any error.
+/// Caller must free the slice with std.heap.c_allocator.free().
+fn tcpFallbackQuery(
+    srv: *const ServerInfo,
+    query_pkt: []const u8,
+    remaining_ms: i64,
+    tcp_buf: []u8,
+) ?[]u8 {
+    if (remaining_ms <= 0) return null;
+
+    // Determine address family from addrlen
+    const af: u32 = if (srv.addrlen == @sizeOf(posix.sockaddr.in))
+        posix.AF.INET
+    else
+        posix.AF.INET6;
+
+    // Create non-blocking TCP socket
+    const tcp_fd = posix.socket(af, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0) catch return null;
+    defer posix.close(tcp_fd);
+
+    // Initiate non-blocking connect; EINPROGRESS is expected
+    posix.connect(tcp_fd, srv.getSockaddr(), srv.addrlen) catch |err| {
+        if (err != error.WouldBlock) return null;
+        // EINPROGRESS — wait for writability
+    };
+
+    // Wait for connect to complete (or timeout)
+    var pfd = posix.pollfd{
+        .fd = tcp_fd,
+        .events = posix.POLL.OUT,
+        .revents = 0,
+    };
+    const connect_timeout: i32 = @intCast(@min(remaining_ms, std.math.maxInt(i32)));
+    const ready = posix.poll((&pfd)[0..1], connect_timeout) catch return null;
+    if (ready == 0) return null; // connect timed out
+    if (pfd.revents & posix.POLL.OUT == 0) return null; // error event
+
+    // Check SO_ERROR to confirm connect succeeded.
+    // posix.getsockopt takes a []u8 slice; length is inferred from the slice.
+    var so_err: i32 = 0;
+    posix.getsockopt(tcp_fd, posix.SOL.SOCKET, posix.SO.ERROR, std.mem.asBytes(&so_err)) catch return null;
+    if (so_err != 0) return null;
+
+    // Build TCP DNS message: 2-byte big-endian length + query
+    const qlen: u16 = @intCast(query_pkt.len);
+    var tcp_hdr: [2]u8 = undefined;
+    tcp_hdr[0] = @truncate(qlen >> 8);
+    tcp_hdr[1] = @truncate(qlen);
+
+    // Send length prefix then query payload
+    const hdr_written = posix.write(tcp_fd, &tcp_hdr) catch return null;
+    if (hdr_written != 2) return null;
+    const body_written = posix.write(tcp_fd, query_pkt) catch return null;
+    if (body_written != query_pkt.len) return null;
+
+    // Read 2-byte response length prefix
+    var len_buf: [2]u8 = undefined;
+    var len_read: usize = 0;
+    const time_after_connect = std.time.milliTimestamp();
+    _ = time_after_connect;
+
+    while (len_read < 2) {
+        var rpfd = posix.pollfd{
+            .fd = tcp_fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        };
+        // Use a generous sub-timeout; the outer deadline is enforced by the
+        // caller discarding stale results.
+        const sub_timeout: i32 = @intCast(@min(remaining_ms, std.math.maxInt(i32)));
+        const r = posix.poll((&rpfd)[0..1], sub_timeout) catch return null;
+        if (r == 0) return null;
+        if (rpfd.revents & posix.POLL.IN == 0) return null;
+        const n = posix.read(tcp_fd, len_buf[len_read..]) catch return null;
+        if (n == 0) return null; // EOF
+        len_read += n;
+    }
+
+    const resp_len: usize = (@as(usize, len_buf[0]) << 8) | @as(usize, len_buf[1]);
+    if (resp_len == 0 or resp_len > tcp_buf.len) return null;
+
+    // Read the full DNS response into tcp_buf
+    var data_read: usize = 0;
+    while (data_read < resp_len) {
+        var rpfd = posix.pollfd{
+            .fd = tcp_fd,
+            .events = posix.POLL.IN,
+            .revents = 0,
+        };
+        const sub_timeout: i32 = @intCast(@min(remaining_ms, std.math.maxInt(i32)));
+        const r = posix.poll((&rpfd)[0..1], sub_timeout) catch return null;
+        if (r == 0) return null;
+        if (rpfd.revents & posix.POLL.IN == 0) return null;
+        const n = posix.read(tcp_fd, tcp_buf[data_read..resp_len]) catch return null;
+        if (n == 0) return null; // EOF before full message
+        data_read += n;
+    }
+
+    return tcp_buf[0..resp_len];
+}
+
 // ===================== Pool Structures =====================
 
 const ServerInfo = struct {
@@ -341,19 +453,40 @@ export fn dns_pool_resolve_batch(
     }
 
     // txid → query index mapping (txid = index + 1)
-    // Send all queries round-robin across servers
+    // Send all queries round-robin across servers, keeping a copy of each
+    // built packet so we can re-send over TCP on truncation.
+    //
+    // pkt_store[i] holds the raw query bytes for query i;
+    // pkt_lens[i] holds the valid length (0 = build failed / already resolved).
+    const allocator = std.heap.c_allocator;
+    const pkt_store = allocator.alloc([MAX_PACKET]u8, num) catch return 0;
+    defer allocator.free(pkt_store);
+    const pkt_lens = allocator.alloc(usize, num) catch return 0;
+    defer allocator.free(pkt_lens);
+    // Per-query server index, so TCP retry goes to the same server.
+    const pkt_srv = allocator.alloc(usize, num) catch return 0;
+    defer allocator.free(pkt_srv);
+
     for (0..num) |i| {
         const srv_idx = i % pool.num_servers;
+        pkt_srv[i] = srv_idx;
         const srv = &pool.servers[srv_idx];
         const txid: u16 = @intCast((i + 1) & 0xFFFF);
 
-        var pkt_buf: [MAX_PACKET]u8 = undefined;
-        const pkt_len = buildPtrQuery(&pkt_buf, txid, @ptrCast(&queries[i].addr), queries[i].addr_len) orelse continue;
+        const pkt_len = buildPtrQuery(&pkt_store[i], txid, @ptrCast(&queries[i].addr), queries[i].addr_len) orelse {
+            pkt_lens[i] = 0;
+            continue;
+        };
+        pkt_lens[i] = pkt_len;
 
-        _ = std.posix.sendto(srv.fd, pkt_buf[0..pkt_len], 0, srv.getSockaddr(), srv.addrlen) catch continue;
+        _ = std.posix.sendto(srv.fd, pkt_store[i][0..pkt_len], 0, srv.getSockaddr(), srv.addrlen) catch continue;
     }
 
-    // Poll for responses
+    // Reusable heap buffer for TCP responses (up to 64 KiB per RFC 1035)
+    const tcp_buf = allocator.alloc(u8, MAX_TCP_PACKET) catch return 0;
+    defer allocator.free(tcp_buf);
+
+    // Poll for UDP responses
     var pollfds: [MAX_SERVERS]std.posix.pollfd = undefined;
     for (0..pool.num_servers) |s| {
         pollfds[s] = .{
@@ -378,7 +511,7 @@ export fn dns_pool_resolve_batch(
 
         for (0..pool.num_servers) |s| {
             if (pollfds[s].revents & std.posix.POLL.IN != 0) {
-                // Read responses
+                // Drain all pending UDP datagrams on this socket
                 while (true) {
                     const n = std.posix.recvfrom(pool.servers[s].fd, &recv_buf, 0, null, null) catch break;
 
@@ -389,8 +522,48 @@ export fn dns_pool_resolve_batch(
                     if (idx >= num) continue;
 
                     const flags = (@as(u16, pkt[2]) << 8) | @as(u16, pkt[3]);
-                    const rcode = flags & 0x000F;
 
+                    // ---- TC (Truncation) bit check ----
+                    // Bit 9 of the flags word (0x0200) indicates the server
+                    // had more data than fit in the 512-byte UDP payload.
+                    // RFC 1035 §4.2.1 mandates a TCP retry in this case.
+                    if (flags & 0x0200 != 0) {
+                        // Only retry if we still have time and have the query packet
+                        const remaining_ms = deadline_ms - elapsed_ms;
+                        const qlen = pkt_lens[idx];
+                        if (remaining_ms > 0 and qlen > 0) {
+                            const srv = &pool.servers[pkt_srv[idx]];
+                            const query_slice = pkt_store[idx][0..qlen];
+                            if (tcpFallbackQuery(srv, query_slice, remaining_ms, tcp_buf)) |resp| {
+                                // Parse the full TCP response
+                                const rcode_tcp = ((@as(u16, resp[2]) << 8) | @as(u16, resp[3])) & 0x000F;
+                                if (rcode_tcp != 0) {
+                                    results[idx].status = 1; // nxdomain or error
+                                } else {
+                                    var hostname: [256]u8 = undefined;
+                                    if (parsePtrResponse(resp, &hostname)) |hlen| {
+                                        @memcpy(results[idx].hostname[0..hlen], hostname[0..hlen]);
+                                        results[idx].hostname[hlen] = 0;
+                                        results[idx].hostname_len = hlen;
+                                        results[idx].status = 0;
+                                    } else {
+                                        results[idx].status = 3;
+                                    }
+                                }
+                                resolved += 1;
+                                pkt_lens[idx] = 0; // mark done so we don't retry again
+                                continue;
+                            }
+                            // TCP attempt failed — fall through to mark as error
+                        }
+                        results[idx].status = 3; // TC set but TCP failed
+                        resolved += 1;
+                        pkt_lens[idx] = 0;
+                        continue;
+                    }
+
+                    // ---- Normal (non-truncated) UDP response ----
+                    const rcode = flags & 0x000F;
                     if (rcode != 0) {
                         results[idx].status = 1; // nxdomain or error
                         resolved += 1;
