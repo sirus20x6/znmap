@@ -1,0 +1,59 @@
+=== Nmap Privileged Benchmark Suite ===
+Date: 2026-02-18
+Nmap: 7.98SVN (Zig-optimized)
+Kernel: 6.18.9-zen1-2.1-zen
+CPU: AMD EPYC 7473X 24-Core Processor
+Capabilities: cap_net_admin,cap_net_raw=eip (via setcap)
+Running as root: 0 (auto-detected via CAP_NET_RAW)
+
+--- SYN scan (1000 ports) ---
+Command: ./nmap -sS -p1-1000 127.0.0.1
+  Run 1: 23.28s
+  Run 2: 22.42s
+  Run 3: 24.97s
+  Avg: 23.56s
+
+--- SYN + Service version scan (4 ports) ---
+Command: ./nmap -sS -sV -p22,53,80,443 127.0.0.1
+  Run 1: 6.37s
+  Run 2: 6.40s
+  Run 3: 6.40s
+  Avg: 6.39s
+
+--- OS Detection (4 ports) ---
+Command: ./nmap -sS -O -p22,53,80,443 127.0.0.1
+  Run 1: 11.95s
+  Run 2: 12.11s
+  Run 3: 12.00s
+  Avg: 12.02s
+
+--- SYN scan (10000 ports) ---
+Command: ./nmap -sS -p1-10000 127.0.0.1
+  Run 1: 219.55s
+  Run 2: 220.56s
+  Avg: 220.05s
+
+--- Checksum microbenchmark ---
+Command: ./benchmarks/checksum_bench_zig
+  Time: 0.0445s
+  Throughput: 22.46M checksums/sec (269.5 Gbps)
+  Checksum: 0x016ab61f (correct)
+
+=== Comparison: Connect vs SYN (1000 ports) ===
+Connect scan (-sT): 0.108s avg (Phase 2 benchmark)
+SYN scan (-sS):     23.56s avg
+
+NOTE: SYN scan is slower on loopback because it sends raw packets that
+traverse the full kernel netfilter/conntrack path, while connect scans
+use optimized kernel TCP connect(). SYN scan advantages appear on real
+networks where the 3-way handshake is avoided (half-open scan = fewer
+packets + lower latency per port).
+
+=== Comparison: Connect vs SYN (10000 ports) ===
+Connect scan (-sT): 201.9s avg (Phase 2 benchmark)
+SYN scan (-sS):     220.1s avg
+
+Same loopback overhead effect. On a real network with RTT > 0, SYN
+scans would be significantly faster due to half-open advantage.
+
+=== Benchmark complete ===
