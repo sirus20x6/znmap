@@ -23,3 +23,13 @@ Command: /thearray/git/security/nmap/benchmarks/../nmap -sV -p22,80,443 127.0.0.
 --- Full connect scan (10000 ports) ---
 Command: /thearray/git/security/nmap/benchmarks/../nmap -sT -sV -p1-10000 127.0.0.1
   Run 1: wall=201.9300s
+  Run 2: wall=201.8083s
+  Run 3: wall=201.8554s
+
+--- Checksum microbenchmark ---
+Command: /thearray/git/security/nmap/benchmarks/checksum_bench
+  Run 1: wall=.0452s
+  Run 2: wall=.0469s
+  Run 3: wall=.0464s
+
+=== Benchmark complete ===
