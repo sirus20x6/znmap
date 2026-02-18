@@ -70,6 +70,21 @@
 #include "nmap_error.h"
 #include "libnetutil/netutil.h"
 
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <linux/capability.h>
+/* Check if the current process has CAP_NET_RAW in its effective set.
+   Uses the raw syscall to avoid requiring libcap. */
+static int has_cap_net_raw(void) {
+  struct __user_cap_header_struct hdr = { _LINUX_CAPABILITY_VERSION_3, 0 };
+  struct __user_cap_data_struct data[2] = {};
+  if (syscall(SYS_capget, &hdr, data) != 0)
+    return 0;
+  /* CAP_NET_RAW is bit 13 — in data[0].effective */
+  return (data[0].effective & (1u << CAP_NET_RAW)) != 0;
+}
+#endif
+
 NmapOps o;
 
 NmapOps::NmapOps() {
@@ -224,8 +239,15 @@ void NmapOps::Initialize() {
     isr00t = 1;
   else if (getenv("NMAP_UNPRIVILEGED"))
     isr00t = 0;
-  else
+  else {
     isr00t = !(geteuid());
+#ifdef __linux__
+    /* Also grant privileged mode when CAP_NET_RAW is set via setcap,
+       even if not running as root. */
+    if (!isr00t && has_cap_net_raw())
+      isr00t = 1;
+#endif
+  }
 #endif
   have_pcap = true;
   debugging = 0;
