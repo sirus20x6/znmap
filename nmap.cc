@@ -1840,6 +1840,12 @@ void nmap_free_mem() {
   nsock_set_default_engine(NULL);
 }
 
+/* Pipeline callback: collects a Target pointer into a vector when a host
+   finishes its port scan, enabling early service detection. */
+static void collect_early_target(Target *t, void *data) {
+  static_cast<std::vector<Target *> *>(data)->push_back(t);
+}
+
 int nmap_main(int argc, char *argv[]) {
   int i;
   std::vector<Target *> Targets;
@@ -2213,9 +2219,21 @@ int nmap_main(int argc, char *argv[]) {
     /* I now have the group for scanning in the Targets vector */
 
     if (!o.noportscan) {
+      /* When service detection (-sV) is also requested, collect hosts that
+         finish their port scan early so we can start version detection on
+         them before the entire group finishes.  This "pipeline" reduces
+         total scan time for large host groups. */
+      std::vector<Target *> early_sv_targets;
+      host_done_cb sv_cb = NULL;
+      void *sv_cb_data = NULL;
+      if (o.servicescan && Targets.size() > 1) {
+        sv_cb = collect_early_target;
+        sv_cb_data = &early_sv_targets;
+      }
+
       // Ultra_scan sets o.scantype for us so we don't have to worry
       if (o.synscan)
-        ultra_scan(Targets, &ports, SYN_SCAN);
+        ultra_scan(Targets, &ports, SYN_SCAN, NULL, sv_cb, sv_cb_data);
 
       if (o.ackscan)
         ultra_scan(Targets, &ports, ACK_SCAN);
@@ -2239,7 +2257,7 @@ int nmap_main(int argc, char *argv[]) {
         ultra_scan(Targets, &ports, UDP_SCAN);
 
       if (o.connectscan)
-        ultra_scan(Targets, &ports, CONNECT_SCAN);
+        ultra_scan(Targets, &ports, CONNECT_SCAN, NULL, sv_cb, sv_cb_data);
 
       if (o.sctpinitscan)
         ultra_scan(Targets, &ports, SCTP_INIT_SCAN);
@@ -2272,7 +2290,25 @@ int nmap_main(int argc, char *argv[]) {
 
       if (o.servicescan) {
         o.current_scantype = SERVICE_SCAN;
-        service_scan(Targets);
+        /* Pipeline: if some hosts completed early during port scanning,
+           service-scan them first as a batch, then handle the rest. */
+        if (!early_sv_targets.empty() && early_sv_targets.size() < Targets.size()) {
+          if (o.verbose)
+            log_write(LOG_STDOUT, "Pipeline: service scanning %lu early-completed hosts\n",
+                      (unsigned long)early_sv_targets.size());
+          service_scan(early_sv_targets);
+          /* Now service-scan the remaining targets that weren't early */
+          std::set<Target *> early_set(early_sv_targets.begin(), early_sv_targets.end());
+          std::vector<Target *> remaining;
+          for (size_t i = 0; i < Targets.size(); i++) {
+            if (early_set.find(Targets[i]) == early_set.end())
+              remaining.push_back(Targets[i]);
+          }
+          if (!remaining.empty())
+            service_scan(remaining);
+        } else {
+          service_scan(Targets);
+        }
       }
     }
 

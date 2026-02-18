@@ -80,9 +80,16 @@
 #include "zig/arena.h"
 class Target;
 
+/* Callback fired when an individual host completes its port scan inside
+   ultra_scan().  The caller can use this to start service detection or
+   other per-host work before the entire scan group finishes.
+   user_data is the opaque pointer passed to ultra_scan(). */
+typedef void (*host_done_cb)(Target *target, void *user_data);
+
 /* 3rd generation Nmap scanning function.  Handles most Nmap port scan types */
 void ultra_scan(std::vector<Target *> &Targets, const struct scan_lists *ports,
-                stype scantype, struct timeout_info *to = NULL);
+                stype scantype, struct timeout_info *to = NULL,
+                host_done_cb on_host_done = NULL, void *cb_data = NULL);
 
 /* Determines an ideal number of hosts to be scanned (port scan, os
    scan, version detection, etc.) in parallel after the ping scan is
@@ -629,6 +636,8 @@ public:
   pcap_t *pd;
   netutil_eth_t *ethsd;
   void *scratch_arena;  // Zig arena for per-scan-group scratch allocations
+  host_done_cb on_host_done;  // Optional callback fired when a host completes
+  void *cb_data;              // Opaque data passed to on_host_done
   u32 seqmask; /* This mask value is used to encode values in sequence
                   numbers.  It is set randomly in UltraScanInfo::Init() */
   u16 base_port;

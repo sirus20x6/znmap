@@ -943,6 +943,8 @@ void UltraScanInfo::Init(std::vector<Target *> &Targets, const struct scan_lists
   gstats->num_hosts_timedout += num_timedout;
 
   scratch_arena = arena_create(4 * 1024 * 1024);  // 4MB scratch arena
+  on_host_done = NULL;
+  cb_data = NULL;
 
   pd = NULL;
   rawsd = -1;
@@ -1183,6 +1185,10 @@ int UltraScanInfo::removeCompletedHosts() {
       completedHosts.insert(hss);
       incompleteHosts.erase(hostI);
       hostsRemoved++;
+      /* Fire the per-host completion callback so callers can start
+         service detection or other work on this host early. */
+      if (on_host_done && !timedout)
+        on_host_done(hss->target, cb_data);
       /* Consider making this host the new global ping host during its
          retirement in the completed hosts list. */
       HostScanStats *pinghost = gstats->pinghost;
@@ -2728,7 +2734,8 @@ static void processData(UltraScanInfo *USI) {
    exists so timing can be shared across invocations of this function. If to is
    NULL (its default value), a default timeout_info will be used. */
 void ultra_scan(std::vector<Target *> &Targets, const struct scan_lists *ports,
-                stype scantype, struct timeout_info *to) {
+                stype scantype, struct timeout_info *to,
+                host_done_cb on_host_done, void *cb_data) {
   o.current_scantype = scantype;
 
   if (Targets.size() == 0) {
@@ -2746,6 +2753,8 @@ void ultra_scan(std::vector<Target *> &Targets, const struct scan_lists *ports,
   o.numhosts_scanning = Targets.size();
 
   UltraScanInfo USI(Targets, ports, scantype);
+  USI.on_host_done = on_host_done;
+  USI.cb_data = cb_data;
 
   /* Load up _all_ payloads into a mapped table. Only needed for raw scans. */
   if (USI.udp_scan || (USI.ping_scan && USI.ptech.rawudpscan) ) {
