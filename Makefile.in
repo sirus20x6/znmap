@@ -114,6 +114,9 @@ export HDRS = charpool.h FingerPrintResults.h FPEngine.h idle_scan.h MACLookup.h
 
 OBJS = charpool.o FingerPrintResults.o FPEngine.o FPModel.o idle_scan.o MACLookup.o nmap_dns.o nmap_error.o nmap.o nmap_ftp.o NmapOps.o NmapOutputTable.o nmap_tty.o osscan2.o osscan.o output.o payload.o portlist.o portreasons.o protocols.o scan_engine.o scan_engine_connect.o scan_engine_raw.o scan_lists.o service_scan.o services.o string_pool.o NewTargets.o TargetGroup.o Target.o targets.o tcpip.o timing.o traceroute.o utils.o xml.o $(NSE_OBJS)
 
+# Zig-optimized object files (override C implementations at link time)
+ZIG_OBJS = zig/checksum.o
+
 # %.o : %.cc -- nope this is a GNU extension
 .cc.o:
 	$(CXX) -c $(CPPFLAGS) $(CXXFLAGS) $< -o $@
@@ -123,13 +126,17 @@ OBJS = charpool.o FingerPrintResults.o FPEngine.o FPModel.o idle_scan.o MACLooku
 # large for field of 2 bytes". Disable debugging for this one file.
 FPModel.o: CXXFLAGS += -g0
 
+# Zig object compilation rules
+zig/checksum.o: zig/checksum.zig
+	zig build-obj -OReleaseFast $< --name checksum 2>&1 && mv checksum.o $@
+
 all: $(TARGET) $(BUILDZENMAP) $(BUILDNDIFF) $(BUILDNPING) $(BUILDNCAT)
 
 $(TARGET): build-netutil @LIBLINEAR_BUILD@ @PCAP_BUILD@ @LIBSSH2_BUILD@ @ZLIB_BUILD@ @PCRE_BUILD@ @NSOCK_BUILD@ @NBASE_BUILD@ @DNET_BUILD@ @LUA_BUILD@ \
-	$(OBJS) main.o
+	$(OBJS) $(ZIG_OBJS) main.o
 	@echo Compiling nmap
 	rm -f $@
-	$(CXX) $(LDFLAGS) -o $@ $(OBJS) main.o $(LIBS)
+	$(CXX) $(LDFLAGS) -o $@ $(OBJS) $(ZIG_OBJS) main.o -Wl,--allow-multiple-definition $(LIBS)
 
 build-pcre: $(LIBPCREDIR)/Makefile
 	@echo Compiling libpcre; cd $(LIBPCREDIR) && $(MAKE)
