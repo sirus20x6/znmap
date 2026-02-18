@@ -132,6 +132,7 @@
 #include "tcpip.h"
 #include "timing.h"
 #include "Target.h"
+#include "zig/dns_pool.h"
 
 extern NmapOps o;
 
@@ -1596,8 +1597,78 @@ void nmap_mass_dns(DNS::Request requests[], int num_requests) {
 
 
 void nmap_mass_rdns(Target ** targets, int num_targets) {
-  /* Second, make an array of pointer to DNS::Request to suit the interface of
-     nmap_mass_rdns. */
+  /* Fast path: use Zig batch DNS resolver for PTR lookups when
+     mass_dns is enabled and DNS servers are available. */
+  if (o.mass_dns && num_targets > 0) {
+    init_servs();
+    if (!servs.empty()) {
+      void *pool = dns_pool_create((uint32_t)servs.size());
+      if (pool) {
+        for (std::list<dns_server>::iterator it = servs.begin();
+             it != servs.end(); ++it) {
+          const struct sockaddr_storage *ss = &it->addr;
+          if (ss->ss_family == AF_INET) {
+            const struct sockaddr_in *sin = (const struct sockaddr_in *)ss;
+            dns_pool_add_server(pool, (const uint8_t *)&sin->sin_addr, 4, 53);
+          } else if (ss->ss_family == AF_INET6) {
+            const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)ss;
+            dns_pool_add_server(pool, (const uint8_t *)&sin6->sin6_addr, 16, 53);
+          }
+        }
+
+        /* Build query array for targets that need resolution */
+        std::vector<DnsQuery> queries;
+        std::vector<int> target_idx; /* maps query position to target index */
+        for (int i = 0; i < num_targets; i++) {
+          Target *target = targets[i];
+          if (!(target->flags & HOST_UP) && !o.always_resolve) continue;
+          const struct sockaddr_storage *tss = target->TargetSockAddr();
+          DnsQuery q;
+          memset(&q, 0, sizeof(q));
+          q.id = (uint32_t)i;
+          if (tss->ss_family == AF_INET) {
+            const struct sockaddr_in *sin = (const struct sockaddr_in *)tss;
+            memcpy(q.addr, &sin->sin_addr, 4);
+            q.addr_len = 4;
+          } else if (tss->ss_family == AF_INET6) {
+            const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)tss;
+            memcpy(q.addr, &sin6->sin6_addr, 16);
+            q.addr_len = 16;
+          } else {
+            continue;
+          }
+          queries.push_back(q);
+          target_idx.push_back(i);
+        }
+
+        if (!queries.empty()) {
+          std::vector<DnsResult> results(queries.size());
+          uint32_t resolved = dns_pool_resolve_batch(
+            pool, queries.data(), (uint32_t)queries.size(),
+            results.data(), 2000 /* 2s timeout */);
+
+          if (o.debugging > 1)
+            log_write(LOG_STDOUT, "Zig DNS pool resolved %u/%lu PTR queries\n",
+                      resolved, (unsigned long)queries.size());
+
+          for (size_t i = 0; i < queries.size(); i++) {
+            if (results[i].status == 0 && results[i].hostname_len > 0) {
+              int tidx = target_idx[i];
+              targets[tidx]->setHostName((const char *)results[i].hostname);
+            }
+          }
+        }
+
+        dns_pool_destroy(pool);
+        /* Return early — Zig resolver handled everything.
+           Targets that didn't resolve will simply have no hostname,
+           same as nxdomain/timeout in the nsock path. */
+        return;
+      }
+    }
+  }
+
+  /* Fallback: original nsock-based mass DNS resolution */
   DNS::Request *requests = new DNS::Request[num_targets];
   for (int i = 0; i < num_targets; i++) {
     Target *target = targets[i];
