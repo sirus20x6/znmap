@@ -69,6 +69,7 @@
 #endif
 
 #include "portreasons.h"
+#include "zig/portstate.h"
 
 #include <vector>
 
@@ -280,6 +281,7 @@ class PortList {
   /* Number of ports in each state per each protocol. */
   int state_counts_proto[PORTLIST_PROTO_MAX][PORT_HIGHEST_STATE];
   Port **port_list[PORTLIST_PROTO_MAX];
+  void *portstate_cache[PORTLIST_PROTO_MAX];
  protected:
   /* Maps port_number to index in port_list array.
    * Only functions: getPortEntry, setPortEntry, initializePortMap and

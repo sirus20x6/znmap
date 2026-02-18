@@ -77,6 +77,7 @@
 #include <vector>
 #include <set>
 #include <algorithm>
+#include "zig/arena.h"
 class Target;
 
 /* 3rd generation Nmap scanning function.  Handles most Nmap port scan types */
@@ -627,6 +628,7 @@ public:
   int rawsd; /* raw socket descriptor */
   pcap_t *pd;
   netutil_eth_t *ethsd;
+  void *scratch_arena;  // Zig arena for per-scan-group scratch allocations
   u32 seqmask; /* This mask value is used to encode values in sequence
                   numbers.  It is set randomly in UltraScanInfo::Init() */
   u16 base_port;

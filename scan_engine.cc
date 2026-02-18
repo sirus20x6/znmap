@@ -734,6 +734,7 @@ UltraScanInfo::~UltraScanInfo() {
 
   delete gstats;
   delete SPM;
+  if (scratch_arena) arena_destroy(scratch_arena);
   if (rawsd >= 0) {
     close(rawsd);
     rawsd = -1;
@@ -940,6 +941,8 @@ void UltraScanInfo::Init(std::vector<Target *> &Targets, const struct scan_lists
 
   gstats = new GroupScanStats(this); /* Peeks at several elements in USI - careful of order */
   gstats->num_hosts_timedout += num_timedout;
+
+  scratch_arena = arena_create(4 * 1024 * 1024);  // 4MB scratch arena
 
   pd = NULL;
   rawsd = -1;
@@ -2831,4 +2834,6 @@ void ultra_scan(std::vector<Target *> &Targets, const struct scan_lists *ports,
 
   if (o.debugging > 2 && USI.pd != NULL)
     pcap_print_stats(LOG_PLAIN, USI.pd);
+
+  if (USI.scratch_arena) arena_reset(USI.scratch_arena);
 }

@@ -407,10 +407,12 @@ PortList::PortList() {
   int proto;
   memset(state_counts_proto, 0, sizeof(state_counts_proto));
   memset(port_list, 0, sizeof(port_list));
+  memset(portstate_cache, 0, sizeof(portstate_cache));
 
   for(proto=0; proto < PORTLIST_PROTO_MAX; proto++) {
     if(port_list_count[proto] > 0)
       port_list[proto] = (Port**) safe_zalloc(sizeof(Port*)*port_list_count[proto]);
+    portstate_cache[proto] = portstate_create();
     default_port_state[proto].proto = PORTLISTPROTO2INPROTO(proto);
     default_port_state[proto].reason.reason_id = ER_NORESPONSE;
     state_counts_proto[proto][default_port_state[proto].state] = port_list_count[proto];
@@ -429,6 +431,8 @@ PortList::~PortList() {
   }
 
   for(proto=0; proto < PORTLIST_PROTO_MAX; proto++) { // for every protocol
+    if (portstate_cache[proto])
+      portstate_destroy(portstate_cache[proto]);
     if(port_list[proto]) {
       for(i=0; i < port_list_count[proto]; i++) { // free every Port
         Port *port = port_list[proto][i];
@@ -497,6 +501,8 @@ void PortList::setPortState(u16 portno, u8 protocol, int state, int *oldstate) {
   }
 
   current->state = state;
+  int mapped = state < 8 ? state : 7;
+  portstate_set(portstate_cache[proto], portno, (uint8_t)mapped);
   state_counts_proto[proto][state]++;
 
   if(state == PORT_FILTERED || state == PORT_OPENFILTERED)
@@ -505,12 +511,13 @@ void PortList::setPortState(u16 portno, u8 protocol, int state, int *oldstate) {
 }
 
 int PortList::getPortState(u16 portno, u8 protocol) {
+  int pidx = INPROTO2PORTLISTPROTO(protocol);
+  uint8_t cached = portstate_get(portstate_cache[pidx], portno);
+  if (cached != 0 && cached < 7) return cached;
   const Port *port;
-
   port = lookupPort(portno, protocol);
   if (port == NULL)
-    return default_port_state[INPROTO2PORTLISTPROTO(protocol)].state;
-
+    return default_port_state[pidx].state;
   return port->state;
 }
 
