@@ -123,6 +123,7 @@ opened, calling these functions has no effect.
 #include <nbase.h>
 
 #include <assert.h>
+#include <format>
 #include <stdarg.h>
 #include <stdio.h>
 #include <list>
@@ -235,7 +236,7 @@ static char *escape(const char *str) {
     } else if (*p < 0x20 || (unsigned char) *p > 0x7F) {
       /* Escape control characters and anything outside of ASCII. We have to
          emit UTF-8 and an easy way to do that is to emit ASCII. */
-      Snprintf(buf, sizeof(buf), "&#x%x;", (unsigned char) *p);
+      Strncpy(buf, std::format("&#x{:x};", static_cast<unsigned char>(*p)).c_str(), sizeof(buf));
       repl = buf;
     } else {
       /* Unescaped character. */

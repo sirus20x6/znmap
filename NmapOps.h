@@ -341,6 +341,8 @@ class NmapOps {
   char *locale;
 
   bool release_memory;	/* suggest to release memory before quitting. used to find memory leaks. */
+  char *pg_dsn;  /* PostgreSQL connection string (--pg-dsn or $NMAP_PG_DSN) */
+  long pg_skip_recent;  /* Skip hosts scanned within this many seconds (0=disabled, default 90 days) */
  private:
   int max_os_tries;
   int max_rtt_timeout;

@@ -121,20 +121,22 @@ individually.
 #include <algorithm>
 #include <list>
 #include <map>
+#include <memory>
+#include <ranges>
 #include <set>
 #include <vector>
 
 extern NmapOps o;
 
 /* The highest TTL we go up to if the target itself doesn't respond. */
-#define MAX_TTL 30
-#define MAX_OUTSTANDING_PROBES 10
-#define MAX_RESENDS 2
+static constexpr int MAX_TTL = 30;
+static constexpr int MAX_OUTSTANDING_PROBES = 10;
+static constexpr int MAX_RESENDS = 2;
 /* In milliseconds. */
-#define PROBE_TIMEOUT 1000
+static constexpr int PROBE_TIMEOUT = 1000;
 /* If the hop cache (including timed-out hops) is bigger than this after a
    round, the hop is cleared and rebuilt from scratch. */
-#define MAX_HOP_CACHE_SIZE 1000
+static constexpr int MAX_HOP_CACHE_SIZE = 1000;
 
 struct Hop;
 class HostState;
@@ -171,14 +173,14 @@ static std::map<struct HopIdent, Hop *> hop_cache;
 /* This would be stack-allocated except for a weird bug on AIX that causes
  * infinite loops when trying to traverse the list. For some reason,
  * dynamically allocating it fixes the bug. */
-static std::list<Hop *> *timedout_hops = NULL;
+static std::unique_ptr<std::list<Hop *>> timedout_hops;
 /* The TTL at which we start sending probes if we don't have a distance
    estimate. This is updated after each host group on the assumption that hosts
    across groups will not differ much in distance. Having this closer to the
    true distance makes the trace faster but is not needed for accuracy. */
 static u8 initial_ttl = 10;
 
-static struct timeval get_now(struct timeval *now = NULL);
+static struct timeval get_now(struct timeval *now = nullptr);
 static const char *ss_to_string(const struct sockaddr_storage *ss);
 
 struct Hop {
@@ -191,7 +193,7 @@ struct Hop {
   std::string hostname;
 
   Hop() {
-    this->parent = NULL;
+    this->parent = nullptr;
     this->addr.ss_family = 0;
     this->ttl = 0;
     this->rtt = -1.0;
@@ -199,7 +201,7 @@ struct Hop {
   }
 
   Hop(u8 ttl, const struct sockaddr_storage &addr, float rtt) {
-    this->parent = NULL;
+    this->parent = nullptr;
     this->addr = addr;
     this->ttl = ttl;
     this->rtt = rtt;
@@ -262,14 +264,14 @@ public:
 
   Probe(HostState *host, struct probespec pspec, u8 ttl);
   virtual ~Probe();
-  void send(int rawsd, netutil_eth_t *ethsd, struct timeval *now = NULL);
-  void resend(int rawsd, netutil_eth_t *ethsd, struct timeval *now = NULL);
-  bool is_timedout(struct timeval *now = NULL) const;
+  void send(int rawsd, netutil_eth_t *ethsd, struct timeval *now = nullptr);
+  void resend(int rawsd, netutil_eth_t *ethsd, struct timeval *now = nullptr);
+  bool is_timedout(struct timeval *now = nullptr) const;
   bool may_resend() const;
   virtual unsigned char *build_packet(const struct sockaddr_storage *source,
     u32 *len) const = 0;
 
-  static Probe *make(HostState *host, struct probespec pspec, u8 ttl);
+  static std::unique_ptr<Probe> make(HostState *host, struct probespec pspec, u8 ttl);
 };
 u16 Probe::token_counter = 0x0000;
 
@@ -318,7 +320,7 @@ HostState::HostState(Target *target) : sent_ttls(MAX_TTL + 1, false) {
   state = HostState::COUNTING_DOWN;
   reached_target = 0;
   pspec = HostState::get_probe(target);
-  hops = NULL;
+  hops = nullptr;
 }
 
 HostState::~HostState() {
@@ -349,11 +351,9 @@ bool HostState::is_finished() const {
 }
 
 bool HostState::send_next_probe(int rawsd, netutil_eth_t *ethsd) {
-  Probe *probe;
-
   /* Do a resend if possible. */
   if (!pending_resends.empty()) {
-    probe = pending_resends.front();
+    Probe *probe = pending_resends.front();
     pending_resends.pop_front();
     active_probes.push_back(probe);
     probe->resend(rawsd, ethsd);
@@ -365,10 +365,11 @@ bool HostState::send_next_probe(int rawsd, netutil_eth_t *ethsd) {
   if (!this->has_more_probes())
     return false;
 
-  probe = Probe::make(this, pspec, current_ttl);
-  unanswered_probes.push_back(probe);
-  active_probes.push_back(probe);
-  probe->send(rawsd, ethsd);
+  auto probe = Probe::make(this, pspec, current_ttl);
+  Probe *raw_probe = probe.release();
+  unanswered_probes.push_back(raw_probe);
+  active_probes.push_back(raw_probe);
+  raw_probe->send(rawsd, ethsd);
   sent_ttls[current_ttl] = true;
 
   return true;
@@ -438,7 +439,7 @@ Hop *HostState::insert_hop(u8 ttl, const struct sockaddr_storage *addr,
   Hop *hop, *prev, *p;
 
   this->child_parent_ttl(ttl, &prev, &p);
-  if (p != NULL && p->ttl == ttl) {
+  if (p != nullptr && p->ttl == ttl) {
     hop = p;
     /* Collision with the same TTL and a different address. */
     if (hop->addr.ss_family == 0) {
@@ -453,9 +454,10 @@ Hop *HostState::insert_hop(u8 ttl, const struct sockaddr_storage *addr,
       }
     }
   } else {
-    hop = new Hop(ttl, *addr, rtt);
+    auto new_hop = std::make_unique<Hop>(ttl, *addr, rtt);
+    hop = new_hop.release();
     hop->parent = p;
-    if (prev == NULL) {
+    if (prev == nullptr) {
       size_t sslen;
       this->hops = hop;
       sslen = sizeof(hop->tag);
@@ -485,21 +487,21 @@ void HostState::link_to(Hop *hop) {
     log_write(LOG_STDOUT, " and %s\n", target->targetipstr());
   }
   hop = merge_hops(&hop->tag, hop, p);
-  if (prev == NULL)
+  if (prev == nullptr)
     this->hops = hop;
   else
     prev->parent = hop;
 }
 
 double HostState::completion_fraction() const {
-  unsigned int i, n;
+  unsigned int n;
 
   if (this->is_finished())
     return 1.0;
 
   n = 0;
-  for (i = 0; i < sent_ttls.size(); i++) {
-    if (sent_ttls[i])
+  for (const bool sent_ttl : sent_ttls) {
+    if (sent_ttl)
       n++;
   }
 
@@ -507,9 +509,9 @@ double HostState::completion_fraction() const {
 }
 
 void HostState::child_parent_ttl(u8 ttl, Hop **child, Hop **parent) const {
-  *child = NULL;
+  *child = nullptr;
   *parent = this->hops;
-  while (*parent != NULL && (*parent)->ttl > ttl) {
+  while (*parent != nullptr && (*parent)->ttl > ttl) {
     *child = *parent;
     *parent = (*parent)->parent;
   }
@@ -595,11 +597,11 @@ void Probe::send(int rawsd, netutil_eth_t *ethsd, struct timeval *now) {
   int decoy;
 
   /* Set up the Ethernet handle if we're using that. */
-  if (ethsd != NULL) {
+  if (ethsd != nullptr) {
     ethp = host->target->FillEthNfo(&eth, ethsd);
     eth.devname[0] = '\0';
   } else {
-    ethp = NULL;
+    ethp = nullptr;
   }
 
   for (decoy = 0; decoy < o.numdecoys; decoy++) {
@@ -652,7 +654,7 @@ public:
     assert(source->ss_family == AF_INET);
     sin = (struct sockaddr_in *) source;
     return build_icmp_raw(&sin->sin_addr, host->target->v4hostip(), ttl,
-      0x0000, 0x00, false, NULL, 0, token, global_id,
+      0x0000, 0x00, false, nullptr, 0, token, global_id,
       pspec.pd.icmp.type, pspec.pd.icmp.code,
       o.extra_payload, o.extra_payload_length, len);
   }
@@ -669,7 +671,7 @@ public:
     int tcpoptslen;
     u32 ack;
 
-    tcpopts = NULL;
+    tcpopts = nullptr;
     tcpoptslen = 0;
     ack = 0;
     if ((pspec.pd.tcp.flags & TH_SYN) == TH_SYN) {
@@ -684,7 +686,7 @@ public:
     if (source->ss_family == AF_INET) {
       const struct sockaddr_in *sin = (struct sockaddr_in *) source;
       return build_tcp_raw(&sin->sin_addr, host->target->v4hostip(), ttl,
-        get_random_u16(), get_random_u8(), false, NULL, 0,
+        get_random_u16(), get_random_u8(), false, nullptr, 0,
         token ^ global_id, pspec.pd.tcp.dport, get_random_u32(), ack, 0x00,
         pspec.pd.tcp.flags, get_random_u16(), 0, (const u8 *) tcpopts, tcpoptslen,
         o.extra_payload, o.extra_payload_length, len);
@@ -717,7 +719,7 @@ public:
     if (source->ss_family == AF_INET) {
       const struct sockaddr_in *sin = (struct sockaddr_in *) source;
       return build_udp_raw(&sin->sin_addr, host->target->v4hostip(), ttl,
-        get_random_u16(), get_random_u8(), false, NULL, 0,
+        get_random_u16(), get_random_u8(), false, nullptr, 0,
         token ^ global_id, pspec.pd.udp.dport,
         (char *) payload, payload_length, len);
     } else if (source->ss_family == AF_INET6) {
@@ -747,7 +749,7 @@ public:
     if (source->ss_family == AF_INET) {
       const struct sockaddr_in *sin = (struct sockaddr_in *) source;
       return build_sctp_raw(&sin->sin_addr, host->target->v4hostip(), ttl,
-        get_random_u16(), get_random_u8(), false, NULL, 0,
+        get_random_u16(), get_random_u8(), false, nullptr, 0,
         token ^ global_id, pspec.pd.sctp.dport, 0UL,
         (char *) &chunk, sizeof(chunk),
         o.extra_payload, o.extra_payload_length, len);
@@ -775,7 +777,7 @@ public:
     if (source->ss_family == AF_INET) {
       const struct sockaddr_in *sin = (struct sockaddr_in *) source;
       return build_ip_raw(&sin->sin_addr, host->target->v4hostip(), pspec.proto, ttl,
-        token ^ global_id, get_random_u8(), false, NULL, 0,
+        token ^ global_id, get_random_u8(), false, nullptr, 0,
         o.extra_payload, o.extra_payload_length, len);
     } else if (source->ss_family == AF_INET6) {
       const struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *) source;
@@ -805,24 +807,24 @@ public:
   }
 };
 
-Probe *Probe::make(HostState *host, struct probespec pspec, u8 ttl)
+std::unique_ptr<Probe> Probe::make(HostState *host, struct probespec pspec, u8 ttl)
 {
   if (pspec.type == PS_ICMP || (pspec.type == PS_PROTO && pspec.proto == IPPROTO_ICMP))
-    return new ICMPProbe(host, pspec, ttl);
+    return std::make_unique<ICMPProbe>(host, pspec, ttl);
   else if (pspec.type == PS_TCP || (pspec.type == PS_PROTO && pspec.proto == IPPROTO_TCP))
-    return new TCPProbe(host, pspec, ttl);
+    return std::make_unique<TCPProbe>(host, pspec, ttl);
   else if (pspec.type == PS_UDP || (pspec.type == PS_PROTO && pspec.proto == IPPROTO_UDP))
-    return new UDPProbe(host, pspec, ttl);
+    return std::make_unique<UDPProbe>(host, pspec, ttl);
   else if (pspec.type == PS_SCTP || (pspec.type == PS_PROTO && pspec.proto == IPPROTO_SCTP))
-    return new SCTPProbe(host, pspec, ttl);
+    return std::make_unique<SCTPProbe>(host, pspec, ttl);
   else if (pspec.type == PS_PROTO)
-    return new IPProtoProbe(host, pspec, ttl);
+    return std::make_unique<IPProtoProbe>(host, pspec, ttl);
   else if (pspec.type == PS_ICMPV6)
-    return new ICMPv6Probe(host, pspec, ttl);
+    return std::make_unique<ICMPv6Probe>(host, pspec, ttl);
   else
     fatal("Unknown probespec type in traceroute");
 
-  return NULL;
+  return nullptr;
 }
 
 TracerouteState::TracerouteState(std::vector<Target *> &targets) {
@@ -838,7 +840,7 @@ TracerouteState::TracerouteState(std::vector<Target *> &targets) {
   }
 
   /* Assume that all the targets share the same device. */
-  if((pd=my_pcap_open_live(targets[0]->deviceName(), 128, o.spoofsource, 2))==NULL)
+  if((pd=my_pcap_open_live(targets[0]->deviceName(), 128, o.spoofsource, 2))==nullptr)
     fatal("%s", PCAP_OPEN_ERRMSG);
   n = Snprintf(pcap_filter, sizeof(pcap_filter), "(ip or ip6) and dst host %s",
     ss_to_string(targets[0]->SourceSockAddr()));
@@ -847,7 +849,8 @@ TracerouteState::TracerouteState(std::vector<Target *> &targets) {
  if (o.debugging)
    log_write(LOG_STDOUT, "Packet capture filter (device %s): %s\n", targets[0]->deviceFullName(), pcap_filter);
   for (it = targets.begin(); it != targets.end(); it++) {
-    HostState *state = new HostState(*it);
+    auto state_holder = std::make_unique<HostState>(*it);
+    HostState *state = state_holder.release();
     hosts.push_back(state);
     active_hosts.push_back(state);
   }
@@ -905,7 +908,7 @@ static Hop *hop_cache_lookup(u8 ttl, const struct sockaddr_storage *addr) {
 
   it = hop_cache.find(ident);
   if (it == hop_cache.end())
-    return NULL;
+    return nullptr;
   else
     return it->second;
 }
@@ -945,7 +948,7 @@ void traceroute_hop_cache_clear() {
    Each hop in the merged chain will be tagged with the given tag.
 
    There are many cases that must be handled correctly by this function: a and b
-   may be equal; either may be NULL; a and b may be disjoint chains or may be
+   may be equal; either may be nullptr; a and b may be disjoint chains or may be
    joined somewhere. The biggest difficulty is when both of the chains have a
    hop with the same TTL but a different address. When this happens we
    arbitrarily choose one of the hops to unlink, on the presumption that any
@@ -959,7 +962,7 @@ static Hop *merge_hops(const struct sockaddr_storage *tag, Hop *a, Hop *b) {
 
   p = &head;
 
-  while (a != NULL && b != NULL && a != b) {
+  while (a != nullptr && b != nullptr && a != b) {
     Hop **next;
 
     if (a->ttl > b->ttl) {
@@ -995,11 +998,11 @@ static Hop *merge_hops(const struct sockaddr_storage *tag, Hop *a, Hop *b) {
     *next = (*next)->parent;
   }
   /* At most one branch of this is taken, even when a == b. */
-  if (a != NULL)
+  if (a != nullptr)
     p->parent = a;
-  else if (b != NULL)
+  else if (b != nullptr)
     p->parent = b;
-  for (; p != NULL; p = p->parent)
+  for (; p != nullptr; p = p->parent)
     p->tag = *tag;
 
   return head.parent;
@@ -1017,7 +1020,7 @@ void TracerouteState::set_host_hop(HostState *host, u8 ttl,
   }
 
   hop = hop_cache_lookup(ttl, from_addr);
-  if (hop == NULL) {
+  if (hop == nullptr) {
     /* A new hop, never before seen with this address and TTL. Add it to the
        host's chain and to the global cache. */
     hop = host->insert_hop(ttl, from_addr, rtt);
@@ -1036,7 +1039,7 @@ void TracerouteState::set_host_hop(HostState *host, u8 ttl,
          tag for the last node, we take responsibility for finishing the trace.
          Otherwise, start counting up. */
 
-      while (hop->parent != NULL) {
+      while (hop->parent != nullptr) {
         hop = hop->parent;
         /* No need to re-probe any merged hops. */
         host->sent_ttls[hop->ttl] = true;
@@ -1056,7 +1059,7 @@ void TracerouteState::set_host_hop(HostState *host, u8 ttl,
 
 /* Record that a hop at the given TTL for the given host timed out. */
 void TracerouteState::set_host_hop_timedout(HostState *host, u8 ttl) {
-  static struct sockaddr_storage EMPTY_ADDR = { 0 };
+  static const struct sockaddr_storage EMPTY_ADDR{};
   host->insert_hop(ttl, &EMPTY_ADDR, -1.0);
 }
 
@@ -1073,7 +1076,7 @@ static bool parse_encapsulated_reply(const void *ip, unsigned len, Reply *reply)
   const void *data;
 
   data = ip_get_data(ip, &len, &hdr);
-  if (data == NULL)
+  if (data == nullptr)
     return false;
 
   if (hdr.version == 4 && hdr.proto == IPPROTO_ICMP) {
@@ -1118,7 +1121,7 @@ static bool decode_reply(const void *ip, unsigned int len, Reply *reply) {
   const void *data;
 
   data = ip_get_data(ip, &len, &hdr);
-  if (data == NULL)
+  if (data == nullptr)
     return false;
 
   reply->from_addr = hdr.src;
@@ -1135,7 +1138,7 @@ static bool decode_reply(const void *ip, unsigned int len, Reply *reply) {
         || icmp->icmp_type == ICMP_UNREACH) {
       /* Get the encapsulated IP packet. */
       const void *encaps = icmp_get_data(icmp, &len);
-      if (encaps == NULL)
+      if (encaps == nullptr)
         return false;
       return parse_encapsulated_reply(encaps, len, reply);
     } else if (icmp->icmp_type == ICMP_ECHOREPLY
@@ -1164,7 +1167,7 @@ static bool decode_reply(const void *ip, unsigned int len, Reply *reply) {
         || icmpv6->icmpv6_type == ICMPV6_UNREACH) {
       /* Get the encapsulated IP packet. */
       const void *encaps = icmpv6_get_data(icmpv6, &len);
-      if (encaps == NULL)
+      if (encaps == nullptr)
         return false;
       return parse_encapsulated_reply(encaps, len, reply);
     } else if (icmpv6->icmpv6_type == ICMPV6_ECHOREPLY) {
@@ -1213,7 +1216,7 @@ static bool read_reply(Reply *reply, pcap_t *pd, long timeout) {
   struct link_header linkhdr;
 
   ip = (struct ip *) readip_pcap(pd, &iplen, timeout, &reply->rcvdtime, &linkhdr, true);
-  if (ip == NULL)
+  if (ip == nullptr)
     return false;
   if (ip->ip_v == 4 || ip->ip_v == 6)
     return decode_reply(ip, iplen, reply);
@@ -1233,15 +1236,14 @@ void TracerouteState::read_replies(long timeout) {
     std::list<Probe *>::iterator it;
     struct timeval oldnow;
     HostState *host;
-    Probe *probe;
     float rtt;
 
     oldnow = now;
     now = get_now();
     timeout -= TIMEVAL_SUBTRACT(now, oldnow);
 
-    probe = this->lookup_probe(&reply.target_addr, reply.token);
-    if (probe == NULL)
+    Probe *probe = this->lookup_probe(&reply.target_addr, reply.token);
+    if (probe == nullptr)
       continue;
     host = probe->host;
 
@@ -1262,7 +1264,7 @@ void TracerouteState::read_replies(long timeout) {
     rtt = TIMEVAL_SUBTRACT(reply.rcvdtime, probe->sent_time) / 1000.0;
     set_host_hop(host, probe->ttl, &reply.from_addr, rtt);
 
-    it = find(host->unanswered_probes.begin(), host->unanswered_probes.end(), probe);
+    it = std::ranges::find(host->unanswered_probes, probe);
     num_active_probes -= host->cancel_probe(it);
   }
 }
@@ -1326,7 +1328,7 @@ void TracerouteState::resolve_hops() {
      re-resolves the addresses of the targets themselves, which is a little
      inefficient. */
   for (host_iter = hosts.begin(); host_iter != hosts.end(); host_iter++) {
-    for (hop = (*host_iter)->hops; hop != NULL; hop = hop->parent) {
+    for (hop = (*host_iter)->hops; hop != nullptr; hop = hop->parent) {
       if (hop->addr.ss_family != AF_UNSPEC)
         addrs.insert(hop->addr);
     }
@@ -1334,12 +1336,12 @@ void TracerouteState::resolve_hops() {
   n = addrs.size();
   /* Second, make an array of pointer to DNS::Request to suit the interface of
      nmap_mass_dns. */
-  DNS::Request *requests = new DNS::Request[n];
+  std::vector<DNS::Request> requests(n);
   for (i = 0, addr_iter = addrs.begin(); i < n; i++, addr_iter++) {
     requests[i].ssv.push_back(*addr_iter);
     requests[i].type = DNS::PTR;
   }
-  nmap_mass_dns(requests, n);
+  nmap_mass_dns(requests.data(), n);
   /* Third, make a map from addresses to names for easy lookup. */
   for (i = 0; i < n; i++) {
     std::string &hostname = requests[i].name;
@@ -1348,7 +1350,7 @@ void TracerouteState::resolve_hops() {
   }
   /* Finally, copy the names into the hops. */
   for (host_iter = hosts.begin(); host_iter != hosts.end(); host_iter++) {
-    for (hop = (*host_iter)->hops; hop != NULL; hop = hop->parent) {
+    for (hop = (*host_iter)->hops; hop != nullptr; hop = hop->parent) {
       if (hop->addr.ss_family != AF_UNSPEC) {
         std::map<sockaddr_storage, const char *, lt_sockaddr_storage>::const_iterator it;
         it = name_map.find(hop->addr);
@@ -1357,7 +1359,6 @@ void TracerouteState::resolve_hops() {
       }
     }
   }
-  delete [] requests;
 }
 
 void TracerouteState::transfer_hops() {
@@ -1365,7 +1366,7 @@ void TracerouteState::transfer_hops() {
   Hop *p;
 
   for (it = hosts.begin(); it != hosts.end(); it++) {
-    for (p = (*it)->hops; p != NULL; p = p->parent) {
+    for (p = (*it)->hops; p != nullptr; p = p->parent) {
       TracerouteHop hop;
 
       /* Trim excessive hops. */
@@ -1412,7 +1413,7 @@ Probe *TracerouteState::lookup_probe(
     }
   }
 
-  return NULL;
+  return nullptr;
 }
 
 double TracerouteState::completion_fraction() const {
@@ -1441,7 +1442,7 @@ static int traceroute_direct(std::vector<Target *> targets) {
     hop.timedout = false;
     hop.rtt = (*it)->to.srtt / 1000.0;
     hostname = (*it)->HostName();
-    if (hostname != NULL && hostname[0] != '\0')
+    if (hostname != nullptr && hostname[0] != '\0')
       hop.name = hostname;
     hop.addr = hop.tag;
     hop.ttl = 1;
@@ -1457,8 +1458,8 @@ static int traceroute_remote(std::vector<Target *> targets) {
   if (targets.empty())
     return 1;
 
-  if (timedout_hops == NULL) {
-    timedout_hops = new std::list<Hop *>;
+  if (timedout_hops == nullptr) {
+    timedout_hops = std::make_unique<std::list<Hop *>>();
   }
 
   TracerouteState global_state(targets);
@@ -1481,10 +1482,10 @@ static int traceroute_remote(std::vector<Target *> targets) {
     global_state.remove_finished_hosts();
 
     if (keyWasPressed())
-      SPM.printStats(global_state.completion_fraction(), NULL);
+      SPM.printStats(global_state.completion_fraction(), nullptr);
   }
 
-  SPM.endTask(NULL, NULL);
+  SPM.endTask(nullptr, nullptr);
 
   if (!o.noresolve)
     global_state.resolve_hops();
@@ -1536,9 +1537,9 @@ int traceroute(std::vector<Target *> &Targets) {
 static struct timeval get_now(struct timeval *now) {
   struct timeval tv;
 
-  if (now != NULL)
+  if (now != nullptr)
     return *now;
-  gettimeofday(&tv, NULL);
+  gettimeofday(&tv, nullptr);
 
   return tv;
 }

@@ -77,12 +77,12 @@
 extern NmapOps o;
 
 Target::Target() {
-  hostname = NULL;
-  targetname = NULL;
+  hostname = nullptr;
+  targetname = nullptr;
   memset(&seq, 0, sizeof(seq));
   distance = -1;
   distance_calculation_method = DIST_METHOD_NONE;
-  FPR = NULL;
+  FPR = nullptr;
   osscan_flag = OS_NOTPERF;
   weird_responses = flags = 0;
   traceroute_probespec.type = PS_NONE;
@@ -94,7 +94,7 @@ Target::Target() {
   directly_connected = -1;
   targetipstring[0] = '\0';
   sourceipstring[0] = '\0';
-  nameIPBuf = NULL;
+  nameIPBuf = nullptr;
   memset(&MACaddress, 0, sizeof(MACaddress));
   memset(&SrcMACaddress, 0, sizeof(SrcMACaddress));
   memset(&NextHopMACaddress, 0, sizeof(NextHopMACaddress));
@@ -113,19 +113,18 @@ Target::Target() {
 
 
 const char * Target::deviceName() const {
-        return (devname[0] != '\0')? devname : NULL;
+        return (devname[0] != '\0')? devname : nullptr;
 }
 
 const char * Target::deviceFullName() const {
-        return (devfullname[0] != '\0')? devfullname : NULL;
+        return (devfullname[0] != '\0')? devfullname : nullptr;
 }
 
 Target::~Target() {
   FreeInternal();
 #ifndef NOLUA
-  for (ScriptResults::iterator it = scriptResults.begin();
-      it != scriptResults.end(); it++) {
-    delete (*it);
+  for (auto *result : scriptResults) {
+    delete result;
   }
 #endif
 }
@@ -140,14 +139,12 @@ void Target::FreeInternal() {
 
   if (nameIPBuf) {
     free(nameIPBuf);
-    nameIPBuf = NULL;
+    nameIPBuf = nullptr;
   }
 
   if (FPR) delete FPR;
-  for (std::vector<EarlySvcResponse *>::iterator it=earlySvcResponses.begin();
-      it != earlySvcResponses.end(); it++) {
-    free(*it);
-  }
+  for (auto *response : earlySvcResponses)
+    free(response);
   earlySvcResponses.clear();
 }
 
@@ -164,9 +161,9 @@ void Target::GenerateTargetIPString() {
 #if HAVE_IPV6
                 (char *) &sin6->sin6_addr,
 #else
-                (char *) NULL,
+                (char *) nullptr,
 #endif
-                targetipstring, sizeof(targetipstring)) == NULL) {
+                targetipstring, sizeof(targetipstring)) == nullptr) {
     fatal("Failed to convert target address to presentation format!?!  Error: %s", strerror(socket_errno()));
   }
 }
@@ -184,9 +181,9 @@ void Target::GenerateSourceIPString() {
 #if HAVE_IPV6
                 (char *) &sin6->sin6_addr,
 #else
-                (char *) NULL,
+                (char *) nullptr,
 #endif
-                sourceipstring, sizeof(sourceipstring)) == NULL) {
+                sourceipstring, sizeof(sourceipstring)) == nullptr) {
     fatal("Failed to convert source address to presentation format!?!  Error: %s", strerror(socket_errno()));
   }
 }
@@ -224,8 +221,8 @@ void Target::setTargetSockAddr(const struct sockaddr_storage *ss, size_t ss_len)
   if (targetsocklen > 0) {
     /* We had an old target sock, so we better blow away the hostname as
        this one may be new. */
-    setHostName(NULL);
-    setTargetName(NULL);
+    setHostName(nullptr);
+    setTargetName(nullptr);
   }
   memcpy(&targetsock, ss, ss_len);
   targetsocklen = ss_len;
@@ -243,13 +240,13 @@ struct in_addr Target::v4host() const {
   return in;
 }
 
-// Returns IPv4 host address or NULL if unavailable.
+// Returns IPv4 host address or nullptr if unavailable.
 const struct in_addr *Target::v4hostip() const {
   struct sockaddr_in *sin = (struct sockaddr_in *) &targetsock;
   if (sin->sin_family == AF_INET) {
     return &(sin->sin_addr);
   }
-  return NULL;
+  return nullptr;
 }
 
 const struct in6_addr *Target::v6hostip() const {
@@ -257,7 +254,7 @@ const struct in6_addr *Target::v6hostip() const {
   if (sin6->sin6_family == AF_INET6) {
     return &(sin6->sin6_addr);
   }
-  return NULL;
+  return nullptr;
 }
 
  /* The source address used to reach the target */
@@ -290,31 +287,31 @@ struct sockaddr_storage Target::source() const {
   return sourcesock;
 }
 
-// Returns IPv4 host address or NULL if unavailable.
+// Returns IPv4 host address or nullptr if unavailable.
 const struct in_addr *Target::v4sourceip() const {
   struct sockaddr_in *sin = (struct sockaddr_in *) &sourcesock;
   if (sin->sin_family == AF_INET) {
     return &(sin->sin_addr);
   }
-  return NULL;
+  return nullptr;
 }
 
-// Returns IPv6 host address or NULL if unavailable.
+// Returns IPv6 host address or nullptr if unavailable.
 const struct in6_addr *Target::v6sourceip() const {
   struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *) &sourcesock;
   if (sin6->sin6_family == AF_INET6) {
     return &(sin6->sin6_addr);
   }
-  return NULL;
+  return nullptr;
 }
 
-  /* You can set to NULL to erase a name or if it failed to resolve -- or
+  /* You can set to nullptr to erase a name or if it failed to resolve -- or
      just don't call this if it fails to resolve */
 void Target::setHostName(const char *name) {
   char *p;
   if (hostname) {
     free(hostname);
-    hostname = NULL;
+    hostname = nullptr;
   }
   if (name) {
     p = hostname = strdup(name);
@@ -333,7 +330,7 @@ void Target::setHostName(const char *name) {
 void Target::setTargetName(const char *name) {
   if (targetname) {
     free(targetname);
-    targetname = NULL;
+    targetname = nullptr;
   }
   if (name) {
     targetname = strdup(name);
@@ -415,13 +412,13 @@ int Target::MTU(void) const {
 
   /* Starts the timeout clock for the host running (e.g. you are
      beginning a scan).  If you do not have the current time handy,
-     you can pass in NULL.  When done, call stopTimeOutClock (it will
+     you can pass in nullptr.  When done, call stopTimeOutClock (it will
      also automatically be stopped of timedOut() returns true) */
 void Target::startTimeOutClock(const struct timeval *now) {
   assert(htn.toclock_running == false);
   htn.toclock_running = true;
   if (now) htn.toclock_start = *now;
-  else gettimeofday(&htn.toclock_start, NULL);
+  else gettimeofday(&htn.toclock_start, nullptr);
   if (!htn.host_start) htn.host_start = htn.toclock_start.tv_sec;
 }
   /* The complement to startTimeOutClock. */
@@ -430,13 +427,13 @@ void Target::stopTimeOutClock(const struct timeval *now) {
   assert(htn.toclock_running == true);
   htn.toclock_running = false;
   if (now) tv = *now;
-  else gettimeofday(&tv, NULL);
+  else gettimeofday(&tv, nullptr);
   htn.msecs_used += TIMEVAL_MSEC_SUBTRACT(tv, htn.toclock_start);
   htn.host_end = tv.tv_sec;
 }
   /* Returns whether the host is timedout.  If the timeoutclock is
-     running, counts elapsed time for that.  Pass NULL if you don't have the
-     current time handy.  You might as well also pass NULL if the
+     running, counts elapsed time for that.  Pass nullptr if you don't have the
+     current time handy.  You might as well also pass nullptr if the
      clock is not running, as the func won't need the time. */
 bool Target::timedOut(const struct timeval *now) const {
   unsigned long used = htn.msecs_used;
@@ -445,7 +442,7 @@ bool Target::timedOut(const struct timeval *now) const {
   if (!o.host_timeout) return false;
   if (htn.toclock_running) {
     if (now) tv = *now;
-    else gettimeofday(&tv, NULL);
+    else gettimeofday(&tv, nullptr);
     used += TIMEVAL_MSEC_SUBTRACT(tv, htn.toclock_start);
   }
 
@@ -484,51 +481,51 @@ void Target::setDeviceNames(const char *name, const char *fullname) {
   if (fullname) Strncpy(devfullname, fullname, sizeof(devfullname));
 }
 
-/* Returns the 6-byte long MAC address, or NULL if none has been set */
+/* Returns the 6-byte long MAC address, or nullptr if none has been set */
 const u8 *Target::MACAddress() const {
-  return (MACaddress_set)? MACaddress : NULL;
+  return (MACaddress_set)? MACaddress : nullptr;
 }
 
 const u8 *Target::SrcMACAddress() const {
-  return (SrcMACaddress_set)? SrcMACaddress : NULL;
+  return (SrcMACaddress_set)? SrcMACaddress : nullptr;
 }
 
 const u8 *Target::NextHopMACAddress() const {
-  return (NextHopMACaddress_set)? NextHopMACaddress : NULL;
+  return (NextHopMACaddress_set)? NextHopMACaddress : nullptr;
 }
 
 eth_nfo *Target::FillEthNfo(eth_nfo *eth, netutil_eth_t *ethsd) const {
-  assert(eth != NULL);
+  assert(eth != nullptr);
   const char *devname = this->deviceName();
-  if (devname == NULL) {
-    return NULL;
+  if (devname == nullptr) {
+    return nullptr;
   }
-  if (ethsd == NULL) {
+  if (ethsd == nullptr) {
     ethsd = eth_open_cached(devname);
   }
   else {
     eth->ethsd = ethsd;
   }
-  if (ethsd == NULL) {
+  if (ethsd == nullptr) {
     error("%s: Failed to open device (%s)", __func__, devname);
-    return NULL;
+    return nullptr;
   }
   if (!netutil_eth_can_send(ethsd)) {
     error("%s: Cannot send on device (%s)", __func__, devname);
-    return NULL;
+    return nullptr;
   }
   if (netutil_eth_datalink(ethsd) == DLT_EN10MB){
     const u8 *src_mac = this->SrcMACAddress();
-    if (src_mac == NULL) {
+    if (src_mac == nullptr) {
       error("%s: Cannot determine source MAC for %s", __func__, this->targetipstr());
-      return NULL;
+      return nullptr;
     }
     const u8 *dst_mac = this->NextHopMACAddress();
-    if (dst_mac == NULL) {
+    if (dst_mac == nullptr) {
       error("%s: Cannot determine next hop MAC for %s", __func__, this->targetipstr());
-      return NULL;
+      return nullptr;
     }
-    assert(eth->srcmac != NULL && eth->dstmac != NULL);
+    assert(eth->srcmac != nullptr && eth->dstmac != nullptr);
     memcpy(eth->srcmac, src_mac, 6);
     memcpy(eth->dstmac, dst_mac, 6);
   }

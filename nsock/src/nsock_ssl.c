@@ -107,6 +107,7 @@ void nsp_ssl_cleanup(struct npool *nsp)
 
 static SSL_CTX *ssl_init_helper(const SSL_METHOD *method) {
   SSL_CTX *ctx;
+  static const unsigned char alpn_protos[] = "\x02h2\x08http/1.1";
 
   if (nsock_ssl_state == NSOCK_SSL_STATE_UNINITIALIZED)
   {
@@ -136,6 +137,10 @@ static SSL_CTX *ssl_init_helper(const SSL_METHOD *method) {
     fatal("OpenSSL failed to create a new SSL_CTX: %s",
           ERR_error_string(ERR_get_error(), NULL));
   }
+
+  if (SSL_CTX_set_alpn_protos(ctx, alpn_protos, sizeof(alpn_protos) - 1) != 0)
+    nsock_log_info("Unable to set ALPN protocols: %s",
+        ERR_error_string(ERR_get_error(), NULL));
 
   /* Our SSL* will always have the SSL_SESSION* inside it, so we neither need to
    * use nor waste memory for the session cache.  (Use '1' because '0' means

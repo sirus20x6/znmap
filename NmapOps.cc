@@ -88,61 +88,61 @@ static int has_cap_net_raw(void) {
 NmapOps o;
 
 NmapOps::NmapOps() {
-  datadir = NULL;
-  xsl_stylesheet = NULL;
+  datadir = nullptr;
+  xsl_stylesheet = nullptr;
   Initialize();
 }
 
 NmapOps::~NmapOps() {
   if (xsl_stylesheet) {
     free(xsl_stylesheet);
-    xsl_stylesheet = NULL;
+    xsl_stylesheet = nullptr;
   }
 
   if (reference_FPs) {
     delete reference_FPs;
-    reference_FPs = NULL;
+    reference_FPs = nullptr;
   }
 
   if (dns_servers) {
     free(dns_servers);
-    dns_servers = NULL;
+    dns_servers = nullptr;
   }
   if (extra_payload) {
     free(extra_payload);
-    extra_payload = NULL;
+    extra_payload = nullptr;
   }
   if (ipoptions) {
     free(ipoptions);
-    ipoptions = NULL;
+    ipoptions = nullptr;
   }
   if (portlist) {
     free(portlist);
-    portlist = NULL;
+    portlist = nullptr;
   }
   if (exclude_portlist) {
     free(exclude_portlist);
-    exclude_portlist = NULL;
+    exclude_portlist = nullptr;
   }
   if (proxy_chain) {
     nsock_proxychain_delete(proxy_chain);
-    proxy_chain = NULL;
+    proxy_chain = nullptr;
   }
   if (exclude_spec) {
     free(exclude_spec);
-    exclude_spec = NULL;
+    exclude_spec = nullptr;
   }
   if (idleProxy) {
     free(idleProxy);
-    idleProxy = NULL;
+    idleProxy = nullptr;
   }
   if (datadir) {
     free(datadir);
-    datadir = NULL;
+    datadir = nullptr;
   }
   if (locale) {
     free(locale);
-    locale = NULL;
+    locale = nullptr;
   }
 
 #ifndef NOLUA
@@ -150,7 +150,7 @@ NmapOps::~NmapOps() {
     close_nse();
   if (scriptargs) {
     free(scriptargs);
-    scriptargs = NULL;
+    scriptargs = nullptr;
   }
 #endif
 }
@@ -175,10 +175,10 @@ int NmapOps::SourceSockAddr(struct sockaddr_storage *ss, size_t *ss_len) {
   return 0;
 }
 
-/* Returns a const pointer to the source address if set, or NULL if unset. */
+/* Returns a const pointer to the source address if set, or nullptr if unset. */
 const struct sockaddr_storage *NmapOps::SourceSockAddr() const {
   if (sourcesock.ss_family == AF_UNSPEC)
-    return NULL;
+    return nullptr;
   else
     return &sourcesock;
 }
@@ -196,7 +196,7 @@ void NmapOps::setSourceSockAddr(struct sockaddr_storage *ss, size_t ss_len) {
 float NmapOps::TimeSinceStart(const struct timeval *now) {
   struct timeval tv;
   if (!now)
-    gettimeofday(&tv, NULL);
+    gettimeofday(&tv, nullptr);
   else tv = *now;
 
   return TIMEVAL_FSEC_SUBTRACT(tv, start_time);
@@ -208,9 +208,9 @@ static char *filename_to_url(const char *filename) {
   char percent_buffer[10];
 
 #if WIN32
-  for (std::string::iterator p = url.begin(); p != url.end(); p++) {
-    if (*p == '\\')
-      *p = '/';
+  for (char &ch : url) {
+    if (ch == '\\')
+      ch = '/';
   }
   /* Put a pseudo-root directory before "C:/" or whatever. */
   url = "/" + url;
@@ -264,7 +264,7 @@ void NmapOps::Initialize() {
   ping_group_sz = PING_GROUP_SZ;
   nogcc = false;
   generate_random_ips = false;
-  reference_FPs = NULL;
+  reference_FPs = nullptr;
   magic_port = 33000 + (get_random_uint() % 31000);
   magic_port_set = false;
   timing_level = 3;
@@ -282,7 +282,7 @@ void NmapOps::Initialize() {
   max_sctp_scan_delay = MAX_SCTP_SCAN_DELAY;
   max_ips_to_scan = 0;
   extra_payload_length = 0;
-  extra_payload = NULL;
+  extra_payload = nullptr;
   host_timeout = 0;
   scan_delay = 0;
   open_only = false;
@@ -310,30 +310,32 @@ void NmapOps::Initialize() {
   ttl = -1;
   badsum = false;
   nmap_stdout = stdout;
-  gettimeofday(&start_time, NULL);
+  gettimeofday(&start_time, nullptr);
   pTrace = vTrace = false;
   reason = false;
   adler32 = false;
   if (datadir) free(datadir);
-  datadir = NULL;
+  datadir = nullptr;
   xsl_stylesheet_set = false;
   if (xsl_stylesheet) free(xsl_stylesheet);
-  xsl_stylesheet = NULL;
+  xsl_stylesheet = nullptr;
   spoof_mac_set = false;
   mass_dns = true;
   deprecated_xml_osclass = false;
   always_resolve = false;
   resolve_all = false;
   unique = false;
-  dns_servers = NULL;
+  dns_servers = nullptr;
+  pg_dsn = nullptr;
+  pg_skip_recent = 7776000; /* 90 days default */
   implicitARPPing = true;
   numhosts_scanned = 0;
   numhosts_up = 0;
   numhosts_scanning = 0;
   noninteractive = false;
-  locale = NULL;
+  locale = nullptr;
   current_scantype = STYPE_UNKNOWN;
-  ipoptions = NULL;
+  ipoptions = nullptr;
   ipoptionslen = 0;
   ipopt_firsthop = 0;
   ipopt_lasthop  = 0;
@@ -341,7 +343,7 @@ void NmapOps::Initialize() {
   topportlevel = -1;
 #ifndef NOLUA
   script = false;
-  scriptargs = NULL;
+  scriptargs = nullptr;
   scriptversion = false;
   scripttrace = false;
   scriptupdatedb = false;
@@ -351,13 +353,13 @@ void NmapOps::Initialize() {
 #endif
   memset(&sourcesock, 0, sizeof(sourcesock));
   sourcesocklen = 0;
-  excludefd = NULL;
-  exclude_spec = NULL;
-  inputfd = NULL;
-  idleProxy = NULL;
-  portlist = NULL;
-  exclude_portlist = NULL;
-  proxy_chain = NULL;
+  excludefd = nullptr;
+  exclude_spec = nullptr;
+  inputfd = nullptr;
+  idleProxy = nullptr;
+  portlist = nullptr;
+  exclude_portlist = nullptr;
+  proxy_chain = nullptr;
   resuming = false;
   discovery_ignore_rst = false;
   multicast_discovery = false;
@@ -615,16 +617,16 @@ void NmapOps::setMaxHostGroupSz(unsigned int sz) {
 
   /* Sets the Name of the XML stylesheet to be printed in XML output.
      If this is never called, a default stylesheet distributed with
-     Nmap is used.  If you call it with NULL as the xslname, no
+     Nmap is used.  If you call it with nullptr as the xslname, no
      stylesheet line is printed. */
 void NmapOps::setXSLStyleSheet(const char *xslname) {
   if (xsl_stylesheet) free(xsl_stylesheet);
-  xsl_stylesheet = xslname? strdup(xslname) : NULL;
+  xsl_stylesheet = xslname? strdup(xslname) : nullptr;
   xsl_stylesheet_set = true;
 }
 
 /* Returns the full path or URL that should be printed in the XML
-   output xml-stylesheet element.  Returns NULL if the whole element
+   output xml-stylesheet element.  Returns nullptr if the whole element
    should be skipped */
 char *NmapOps::XSLStyleSheet() {
   char tmpxsl[MAXPATHLEN];
@@ -650,11 +652,8 @@ void NmapOps::setSpoofMACAddress(u8 *mac_data) {
 
 #ifndef NOLUA
 void NmapOps::chooseScripts(char* argument) {
-        char *p;
-
         for (;;) {
-                p = strchr(argument, ',');
-                if (p == NULL) {
+                if (char *p = strchr(argument, ','); p == nullptr) {
                         chosenScripts.push_back(std::string(argument));
                         break;
                 } else {

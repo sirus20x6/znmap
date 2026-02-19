@@ -67,6 +67,9 @@
 #include "libnetutil/netutil.h"
 #include <pcap.h>
 
+#include <array>
+#include <memory>
+#include <span>
 #include <vector>
 #include <list>
 #include "timing.h"
@@ -234,15 +237,18 @@ class HostOsScanStats {
   void initScanStats();
   struct eth_nfo *fill_eth_nfo(struct eth_nfo *eth, netutil_eth_t *ethsd) const;
   void addNewProbe(OFProbeType type, int subid);
-  void removeActiveProbe(std::list<OFProbe *>::iterator probeI);
+  using ProbeList = std::list<std::unique_ptr<OFProbe>>;
+  using ProbeIterator = ProbeList::iterator;
+  void removeActiveProbe(ProbeIterator probeI);
   /* Get an active probe from active probe list identified by probe type
    * and subid.  returns probesActive.end() if there isn't one. */
-  std::list<OFProbe *>::iterator getActiveProbe(OFProbeType type, int subid);
-  void moveProbeToActiveList(std::list<OFProbe *>::iterator probeI);
-  void moveProbeToUnSendList(std::list<OFProbe *>::iterator probeI);
+  ProbeIterator getActiveProbe(OFProbeType type, int subid);
+  void moveProbeToActiveList(ProbeIterator probeI);
+  void moveProbeToUnSendList(ProbeIterator probeI);
   unsigned int numProbesToSend() const {return probesToSend.size();}
   unsigned int numProbesActive() const {return probesActive.size();}
-  FingerPrint *getFP() const {return FP;}
+  FingerPrint *getFP() const {return FP.get();}
+  std::unique_ptr<FingerPrint> takeFP() { return std::move(FP); }
 
   Target *target; /* the Target */
   struct seq_info si;
@@ -277,8 +283,8 @@ class HostOsScanStats {
    * probesToSend and appended to probesActive. If any probes in
    * probesActive are timedout, they will be moved to probesToSend and
    * sent again till expired. */
-  std::list<OFProbe *> probesToSend;
-  std::list<OFProbe *> probesActive;
+  ProbeList probesToSend;
+  ProbeList probesActive;
 
   /* A record of total number of probes that have been sent to this
    * host, including retransmitted ones. */
@@ -292,8 +298,8 @@ class HostOsScanStats {
 
   /* Fingerprint of this target. When a scan is completed, it'll
    * finally be passed to hs->target->FPR->FPs[x]. */
-  FingerPrint *FP;
-  FingerTest *FPtests[NUM_FPTESTS];
+  std::unique_ptr<FingerPrint> FP;
+  std::array<std::unique_ptr<FingerTest>, NUM_FPTESTS> FPtests;
   #define FP_TSeq  FPtests[ID2INT(FingerPrintDef::SEQ)]
   #define FP_TOps  FPtests[ID2INT(FingerPrintDef::OPS)]
   #define FP_TWin  FPtests[ID2INT(FingerPrintDef::WIN)]
@@ -349,7 +355,7 @@ class HostOsScan {
   ~HostOsScan();
 
   pcap_t *pd;
-  ScanStats *stats;
+  std::unique_ptr<ScanStats> stats;
 
   /* (Re)Initialize the parameters that will be used during the scan.*/
   void reInitScanSystem();
@@ -413,11 +419,11 @@ private:
 
   /* Generic sending functions used by the above probe functions. */
   int send_tcp_probe(HostOsScanStats *hss,
-                     int ttl, bool df, u8* ipopt, int ipoptlen,
+                     int ttl, bool df, std::span<const u8> ipopt,
                      u16 sport, u16 dport, u32 seq, u32 ack,
                      u8 reserved, u8 flags, u16 window, u16 urp,
-                     u8 *options, int optlen,
-                     char *data, u16 datalen);
+                     std::span<const u8> options,
+                     std::span<const char> data);
   int send_icmp_echo_probe(HostOsScanStats *hss,
                            u8 tos, bool df, u8 pcode,
                            unsigned short id, u16 seq, u16 datalen);
@@ -428,7 +434,7 @@ private:
   void makeTOpsFP(HostOsScanStats *hss);
   void makeTWinFP(HostOsScanStats *hss);
 
-  int get_tcpopt_string(const struct tcp_hdr *tcp, int mss, char *result, int maxlen) const;
+  int get_tcpopt_string(const struct tcp_hdr *tcp, int mss, std::span<char> result) const;
 
   int rawsd;    /* Raw socket descriptor */
   netutil_eth_t *ethsd; /* Ethernet handle       */
@@ -459,7 +465,8 @@ class OsScanInfo {
   /* If you remove from this, you had better adjust nextI too (or call
    * resetHostIterator() afterward). Don't let this list get empty,
    * then add to it again, or you may mess up nextI (I'm not sure) */
-  std::list<HostOsScanInfo *> incompleteHosts;
+  using HostList = std::list<std::unique_ptr<HostOsScanInfo>>;
+  HostList incompleteHosts;
 
   unsigned int numIncompleteHosts() const {return incompleteHosts.size();}
   HostOsScanInfo *findIncompleteHost(const struct sockaddr_storage *ss);
@@ -479,7 +486,7 @@ class OsScanInfo {
 
  private:
   unsigned int numInitialTargets;
-  std::list<HostOsScanInfo *>::iterator nextI;
+  HostList::iterator nextI;
 };
 
 
@@ -497,11 +504,11 @@ class HostOsScanInfo {
   Target *target;       /* The target                                  */
   FingerPrintResultsIPv4 *FPR;
   OsScanInfo *OSI;      /* The OSI which contains this HostOsScanInfo  */
-  FingerPrint **FPs;    /* Fingerprints of the host                    */
-  FingerPrintResultsIPv4 *FP_matches; /* Fingerprint-matching results      */
+  std::vector<std::unique_ptr<FingerPrint>> FPs;    /* Fingerprints of the host                    */
+  std::vector<FingerPrintResultsIPv4> FP_matches; /* Fingerprint-matching results      */
   bool timedOut;        /* Did it time out?                            */
   bool isCompleted;     /* Has the OS detection been completed?        */
-  HostOsScanStats *hss; /* Scan status of the host in one scan round   */
+  std::unique_ptr<HostOsScanStats> hss; /* Scan status of the host in one scan round   */
 };
 
 
@@ -524,4 +531,3 @@ class OSScan {
 };
 
 #endif /*OSSCAN2_H*/
-

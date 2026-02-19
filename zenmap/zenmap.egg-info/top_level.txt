@@ -1,0 +1,4 @@
+ndiff
+radialnet
+zenmapCore
+zenmapGUI

@@ -69,4 +69,10 @@ libz/configure.log
 !zenmap/share/zenmap/locale/Makefile
 benchmarks/checksum_bench
 zig/.zig-cache/
-zig/checksum.o
+zig/*.o
+.zig-global-cache/
+.zig-local-cache/
+builddir/
+builddir-pgo/
+builddir-pgo-gen/
+builddir-pgo-profile/

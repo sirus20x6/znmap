@@ -113,9 +113,12 @@
 //   and display it in a ScanProgressMeter
 
 #include <limits.h>
+#include <array>
+#include <cstdio>
 #include <list>
 #include <fstream>
 #include <istream>
+#include <string_view>
 
 #ifdef WIN32
 #include "nmap_winconfig.h"
@@ -501,7 +504,7 @@ static void do_possible_writes() {
   std::list<dns_server>::iterator servI;
   bool all_servs_disconnected = true;
 
-  for(servI = servs.begin(); servI != servs.end(); servI++) {
+  for (servI = servs.begin(); servI != servs.end(); ++servI) {
     switch (servI->status) {
       case dns_server::CONNECTED:
         all_servs_disconnected = false;
@@ -560,7 +563,7 @@ static DNS::RECORD_TYPE wire_type(DNS::RECORD_TYPE t) {
 // (calls nsock_write()). Does various other tasks like recording
 // the time for the timeout.
 static void put_dns_packet_on_wire(request *req) {
-  static const size_t maxlen = 512;
+  constexpr size_t maxlen = 512;
   u8 packet[maxlen];
   size_t plen=0;
   dns_server *srv = req->curr_server;
@@ -588,7 +591,9 @@ static void put_dns_packet_on_wire(request *req) {
   srv->in_process.push_front(req);
   record.tpreq = req;
   record.server = srv;
-  records[req->id] = record;
+  auto [record_it, record_inserted] = records.insert(std::make_pair(req->id, record));
+  if (!record_inserted)
+    record_it->second = record;
   memcpy(&req->sent, nsock_gettimeofday(), sizeof(struct timeval));
 
   req->status = request::WRITE_PENDING;
@@ -689,7 +694,9 @@ static int deal_with_timedout_reads(bool adjust_timing) {
             info record;
             record.tpreq = tpreq;
             record.server = &*servItemp;
-            records[tpreq->id] = record;
+            auto [record_it, record_inserted] = records.insert(std::make_pair(tpreq->id, record));
+            if (!record_inserted)
+              record_it->second = record;
             servItemp->to_process.push_back(tpreq);
           }
         } else {
@@ -884,8 +891,8 @@ static void read_evt_handler(nsock_pool nsp, nsock_event evt, void *ctx) {
   {
     // Check if this was a nonstandard name;
     if (reqt->type != DNS::PTR) {
-      for (std::string::const_iterator it=reqt->name.begin(); it < reqt->name.end(); it++) {
-        if (*it < '0') { // signed char comparison; non-ascii are < 0
+      for (const auto c : reqt->name) {
+        if (c < '0') { // signed char comparison; non-ascii are < 0
           // system resolver might be able to do better with things like AI_IDN
           process_request(ACTION_SYSTEM_RESOLVE, reqinfo);
           processing_successful = true;
@@ -924,10 +931,8 @@ static void read_evt_handler(nsock_pool nsp, nsock_event evt, void *ctx) {
   ip.ss_family = AF_UNSPEC;
   std::string alias;
 
-  for(std::list<DNS::Answer>::const_iterator it = p.answers.begin();
-      it != p.answers.end(); ++it )
+  for (const auto &a : p.answers)
   {
-    const DNS::Answer &a = *it;
     if(a.record_class == DNS::CLASS_IN)
     {
       if (wire_type(reqt->type) == a.record_type) {
@@ -1003,15 +1008,15 @@ static void connect_evt_handler(nsock_pool nsp, nsock_event evt, void *srv_v) {
   srv->status = dns_server::CONNECTED;
 }
 
-static void add_dns_server(const struct sockaddr_storage *addr, size_t addr_len, const char *hostname) {
+static void add_dns_server(const struct sockaddr_storage *addr, size_t addr_len, std::string_view hostname) {
   const sockaddr_storage *ss = o.SourceSockAddr();
   if (o.spoofsource && ss && ss->ss_family != addr->ss_family) {
     // Can't connect to this address family using the specified source (-S)
     return;
   }
 
-  std::list<dns_server>::iterator servI;
-  for(servI = servs.begin(); servI != servs.end(); servI++) {
+  auto servI = servs.begin();
+  for (; servI != servs.end(); ++servI) {
     // Already added!
     if (memcmp(addr, &servI->addr, addr_len) == 0) break;
   }
@@ -1026,7 +1031,7 @@ static void add_dns_server(const struct sockaddr_storage *addr, size_t addr_len,
 
     servs.push_front(tpserv);
 
-    if (o.debugging) log_write(LOG_STDOUT, "mass_dns: Using DNS server %s\n", hostname);
+    if (o.debugging) log_write(LOG_STDOUT, "mass_dns: Using DNS server %s\n", tpserv.hostname.c_str());
   }
 }
 
@@ -1050,7 +1055,7 @@ static void add_dns_server(char *ipaddrs) {
 
 // Creates a new nsi for each DNS server
 static void connect_dns_servers() {
-  std::list<dns_server>::iterator serverI;
+  auto serverI = servs.begin();
   struct sockaddr_storage ss, ss2;
   size_t sslen = 0, ss2len = 0;
   if (o.SourceSockAddr()) {
@@ -1064,7 +1069,7 @@ static void connect_dns_servers() {
       }
     }
   }
-  for(serverI = servs.begin(); serverI != servs.end(); serverI++) {
+  for (serverI = servs.begin(); serverI != servs.end(); ++serverI) {
     serverI->nsd = nsock_iod_new(dnspool, NULL);
     if (sslen > 0 && ss.ss_family == serverI->addr.ss_family) {
       nsock_iod_set_localaddr(serverI->nsd, &ss, sslen);
@@ -1183,8 +1188,8 @@ static void parse_resolvdotconf() {
 }
 
 
-static void parse_etchosts(const char *fname) {
-  std::ifstream ifs(fname);
+static void parse_etchosts(std::string_view fname) {
+  std::ifstream ifs{std::string(fname)};
   std::string line;
   sockaddr_storage ia;
   size_t ialen;
@@ -1370,12 +1375,11 @@ static void nmap_mass_dns_core(DNS::Request *requests, int num_requests) {
   total_reqs = 0;
 
   // Set up the request structure
-  for (int i=0; i < num_requests; i++)
+  for (int i = 0; i < num_requests; ++i)
   {
     DNS::Request &reqt = requests[i];
 
     // See if it's cached
-    std::map<NameRecord, sockaddr_storage>::const_iterator it;
     switch (reqt.type) {
       case DNS::PTR:
         assert(reqt.ssv.size() > 0);
@@ -1384,12 +1388,10 @@ static void nmap_mass_dns_core(DNS::Request *requests, int num_requests) {
         }
         break;
       case DNS::ANY:
-        it = etchosts.find(NameRecord(reqt.name, DNS::A));
-        if (it != etchosts.end()) {
+        if (auto it = etchosts.find(NameRecord(reqt.name, DNS::A)); it != etchosts.end()) {
           reqt.ssv.push_back(it->second);
         }
-        it = etchosts.find(NameRecord(reqt.name, DNS::AAAA));
-        if (it != etchosts.end()) {
+        if (auto it = etchosts.find(NameRecord(reqt.name, DNS::AAAA)); it != etchosts.end()) {
           reqt.ssv.push_back(it->second);
         }
         if (reqt.ssv.size() > 0) {
@@ -1398,8 +1400,7 @@ static void nmap_mass_dns_core(DNS::Request *requests, int num_requests) {
         break;
       case DNS::A:
       case DNS::AAAA:
-        it = etchosts.find(NameRecord(reqt.name, reqt.type));
-        if (it != etchosts.end()) {
+        if (auto it = etchosts.find(NameRecord(reqt.name, reqt.type)); it != etchosts.end()) {
           reqt.ssv.push_back(it->second);
           continue;
         }
@@ -1604,9 +1605,8 @@ void nmap_mass_rdns(Target ** targets, int num_targets) {
     if (!servs.empty()) {
       void *pool = dns_pool_create((uint32_t)servs.size());
       if (pool) {
-        for (std::list<dns_server>::iterator it = servs.begin();
-             it != servs.end(); ++it) {
-          const struct sockaddr_storage *ss = &it->addr;
+        for (const auto &server : servs) {
+          const struct sockaddr_storage *ss = &server.addr;
           if (ss->ss_family == AF_INET) {
             const struct sockaddr_in *sin = (const struct sockaddr_in *)ss;
             dns_pool_add_server(pool, (const uint8_t *)&sin->sin_addr, 4, 53);
@@ -1619,7 +1619,7 @@ void nmap_mass_rdns(Target ** targets, int num_targets) {
         /* Build query array for targets that need resolution */
         std::vector<DnsQuery> queries;
         std::vector<int> target_idx; /* maps query position to target index */
-        for (int i = 0; i < num_targets; i++) {
+        for (int i = 0; i < num_targets; ++i) {
           Target *target = targets[i];
           if (!(target->flags & HOST_UP) && !o.always_resolve) continue;
           const struct sockaddr_storage *tss = target->TargetSockAddr();
@@ -1651,7 +1651,7 @@ void nmap_mass_rdns(Target ** targets, int num_targets) {
             log_write(LOG_STDOUT, "Zig DNS pool resolved %u/%lu PTR queries\n",
                       resolved, (unsigned long)queries.size());
 
-          for (size_t i = 0; i < queries.size(); i++) {
+          for (size_t i = 0; i < queries.size(); ++i) {
             if (results[i].status == 0 && results[i].hostname_len > 0) {
               int tidx = target_idx[i];
               targets[tidx]->setHostName((const char *)results[i].hostname);
@@ -1670,7 +1670,7 @@ void nmap_mass_rdns(Target ** targets, int num_targets) {
 
   /* Fallback: original nsock-based mass DNS resolution */
   DNS::Request *requests = new DNS::Request[num_targets];
-  for (int i = 0; i < num_targets; i++) {
+  for (int i = 0; i < num_targets; ++i) {
     Target *target = targets[i];
     if (!(target->flags & HOST_UP) && !o.always_resolve) continue;
 
@@ -1679,7 +1679,7 @@ void nmap_mass_rdns(Target ** targets, int num_targets) {
     reqt.type = DNS::PTR;
   }
   nmap_mass_dns(requests, num_targets);
-  for (int i = 0; i < num_targets; i++) {
+  for (int i = 0; i < num_targets; ++i) {
     std::string &name = requests[i].name;
     if (!name.empty()) {
       targets[i]->setHostName(name.c_str());
@@ -1696,17 +1696,16 @@ std::list<std::string> get_dns_servers() {
   // of servers.
   assert(o.mass_dns || servs.empty());
 
-  std::list<dns_server>::iterator servI;
   std::list<std::string> serverList;
-  for(servI = servs.begin(); servI != servs.end(); servI++) {
-    serverList.push_back(inet_socktop((struct sockaddr_storage *) &servI->addr));
+  for (const auto &serv : servs) {
+    serverList.push_back(inet_socktop((struct sockaddr_storage *) &serv.addr));
   }
   return serverList;
 }
 
 bool DNS::Factory::ipToPtr(const sockaddr_storage &ip, std::string &ptr)
 {
-  static const size_t maxlen = sizeof("0.0.1.1.2.2.3.3.4.4.5.5.6.6.7.7.8.8.9.9.a.a.b.b.c.c.d.d.e.e.f.f.ip6.arpa");
+  constexpr size_t maxlen = sizeof("0.0.1.1.2.2.3.3.4.4.5.5.6.6.7.7.8.8.9.9.a.a.b.b.c.c.d.d.e.e.f.f.ip6.arpa");
   ptr.reserve(maxlen);
   char tmp[INET_ADDRSTRLEN];
   switch (ip.ss_family) {
@@ -1714,7 +1713,8 @@ bool DNS::Factory::ipToPtr(const sockaddr_storage &ip, std::string &ptr)
     {
       const u32 ipv4_addr = ((const sockaddr_in *) &ip)->sin_addr.s_addr;
       const u8 *ipv4_c = (const u8 *)&ipv4_addr;
-      sprintf(tmp, "%d.%d.%d.%d", ipv4_c[3], ipv4_c[2], ipv4_c[1], ipv4_c[0]);
+      std::snprintf(tmp, sizeof(tmp), "%u.%u.%u.%u",
+                    ipv4_c[3], ipv4_c[2], ipv4_c[1], ipv4_c[0]);
       ptr = tmp;
       ptr += IPV4_PTR_DOMAIN;
       break;
@@ -1723,10 +1723,10 @@ bool DNS::Factory::ipToPtr(const sockaddr_storage &ip, std::string &ptr)
     {
       ptr.clear();
       const struct sockaddr_in6 &s6 = (const struct sockaddr_in6 &) ip;
-      const u8 * ipv6 = s6.sin6_addr.s6_addr;
-      for (short i=15; i>=0; --i)
+      const u8 *ipv6 = s6.sin6_addr.s6_addr;
+      for (short i = 15; i >= 0; --i)
       {
-        sprintf(tmp, "%02x", ipv6[i]);
+        std::snprintf(tmp, sizeof(tmp), "%02x", ipv6[i]);
         ptr += '.';
         ptr += tmp[1];
         ptr += '.';
@@ -1744,16 +1744,18 @@ bool DNS::Factory::ipToPtr(const sockaddr_storage &ip, std::string &ptr)
 
 bool DNS::Factory::ptrToIp(const std::string &ptr, sockaddr_storage &ip)
 {
-  const char *cptr = ptr.c_str();
+  const auto ptr_view = std::string_view(ptr);
+  const char *cptr = ptr_view.data();
   const char *p = NULL;
 
   memset(&ip, 0, sizeof(sockaddr_storage));
 
   // Check whether the name ends with the IPv4 PTR domain
-  if (NULL != (p = strcasestr(cptr + ptr.length() + 1 - sizeof(C_IPV4_PTR_DOMAIN), C_IPV4_PTR_DOMAIN)))
+  if (ptr_view.size() >= sizeof(C_IPV4_PTR_DOMAIN) - 1 &&
+      NULL != (p = strcasestr(cptr + ptr_view.size() + 1 - sizeof(C_IPV4_PTR_DOMAIN), C_IPV4_PTR_DOMAIN)))
   {
     struct sockaddr_in *ip4 = (struct sockaddr_in *)&ip;
-    static const u8 place_value[] = {1, 10, 100};
+    static constexpr std::array<u8, 3> place_value = {1, 10, 100};
     u8 *v = (u8 *) &(ip4->sin_addr.s_addr);
     size_t place = 0;
     size_t i = 0;
@@ -1785,7 +1787,8 @@ bool DNS::Factory::ptrToIp(const std::string &ptr, sockaddr_storage &ip)
     ip.ss_family = AF_INET;
   }
   // If not, check IPv6
-  else if (NULL != (p = strcasestr(cptr + ptr.length() + 1 - sizeof(C_IPV6_PTR_DOMAIN), C_IPV6_PTR_DOMAIN)))
+  else if (ptr_view.size() >= sizeof(C_IPV6_PTR_DOMAIN) - 1 &&
+           NULL != (p = strcasestr(cptr + ptr_view.size() + 1 - sizeof(C_IPV6_PTR_DOMAIN), C_IPV6_PTR_DOMAIN)))
   {
     struct sockaddr_in6 *ip6 = (struct sockaddr_in6 *)&ip;
     u8 alt = 0;
@@ -1875,28 +1878,28 @@ size_t DNS::Factory::putUnsignedShort(u16 num, u8 *buf, size_t offset, size_t ma
 
 size_t DNS::Factory::putDomainName(const std::string &name, u8 *buf, size_t offset, size_t maxlen)
 {
-  size_t ret=0;
+  size_t ret = 0;
   if( !( buf && (maxlen > (offset + name.length() + 1))) ) return ret;
 
   std::string namew = name + ".";
   std::string accumulator;
-  for (std::string::const_iterator c=namew.begin(); c != namew.end(); ++c)
+  for (const auto c : namew)
   {
-    if((*c)=='.')
+    if (c == '.')
     {
       u8 length = accumulator.length();
-      *(buf+offset+ret) = length;
+      *(buf + offset + ret) = length;
       ret += 1;
 
-      memcpy(buf+offset+ret, accumulator.c_str(), length);
+      memcpy(buf + offset + ret, accumulator.c_str(), length);
       ret += length;
       accumulator.clear();
     }
     else
-      accumulator += (*c);
+      accumulator += c;
   }
 
-  *(buf+offset+ret) = 0;
+  *(buf + offset + ret) = 0;
   ret += 1;
 
   return ret;

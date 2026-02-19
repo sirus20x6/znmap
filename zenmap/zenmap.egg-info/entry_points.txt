@@ -1,0 +1,5 @@
+[console_scripts]
+ndiff = ndiff:run_main
+
+[gui_scripts]
+zenmap = zenmapGUI.App:run

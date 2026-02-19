@@ -76,8 +76,15 @@
 
 #include "struct_ip.h"
 
+#include <algorithm>
+#include <array>
+#include <format>
 #include <list>
 #include <math.h>
+#include <memory>
+#include <ranges>
+#include <span>
+#include <string>
 
 extern NmapOps o;
 
@@ -380,30 +387,18 @@ const char *tsseqclass2ascii(int seqclass) {
 /** Sets up the pcap descriptor in HOS (obtains a descriptor and sets the
  * appropriate BPF filter, based on the supplied list of targets). */
 static void begin_sniffer(HostOsScan *HOS, std::vector<Target *> &Targets) {
-  char pcap_filter[2048];
-  /* 20 IPv6 addresses is max (45 byte addy + 14 (" or src host ")) * 20 == 1180 */
-  char dst_hosts[1200];
-  int filterlen = 0;
-  int len;
-  unsigned int targetno;
-  bool doIndividual = Targets.size() <= 20; // Don't bother IP limits if scanning huge # of hosts
-  pcap_filter[0] = '\0';
+  std::string pcap_filter;
+  std::string dst_hosts;
+  const bool doIndividual = Targets.size() <= 20; // Don't bother IP limits if scanning huge # of hosts
 
   /* If we have 20 or less targets, build a list of addresses so we can set
    * an explicit BPF filter */
   if (doIndividual) {
-    for (targetno = 0; targetno < Targets.size(); targetno++) {
-      len = Snprintf(dst_hosts + filterlen,
-                     sizeof(dst_hosts) - filterlen,
-                     "%ssrc host %s", (targetno == 0)? "" : " or ",
-                     Targets[targetno]->targetipstr());
-      if (len < 0 || len + filterlen >= (int) sizeof(dst_hosts))
-        fatal("ran out of space in dst_hosts");
-      filterlen += len;
+    for (size_t targetno = 0; targetno < Targets.size(); targetno++) {
+      dst_hosts += std::format("{}src host {}", (targetno == 0) ? "" : " or ",
+                               Targets[targetno]->targetipstr());
     }
-    len = Snprintf(dst_hosts + filterlen, sizeof(dst_hosts) - filterlen, ")))");
-    if (len < 0 || len + filterlen >= (int) sizeof(dst_hosts))
-      fatal("ran out of space in dst_hosts");
+    dst_hosts += ")))";
   }
 
   /* Open a network interface for packet capture */
@@ -415,19 +410,16 @@ static void begin_sniffer(HostOsScan *HOS, std::vector<Target *> &Targets) {
   struct sockaddr_storage ss = Targets[0]->source();
   /* Build the final BPF filter */
   if (ss.ss_family == AF_INET) {
+    const auto src = inet_ntoa(((struct sockaddr_in *)&ss)->sin_addr);
     if (doIndividual)
-      len = Snprintf(pcap_filter, sizeof(pcap_filter), "dst host %s and (icmp or (tcp and (%s",
-                   inet_ntoa(((struct sockaddr_in *)&ss)->sin_addr), dst_hosts);
+      pcap_filter = std::format("dst host {} and (icmp or (tcp and ({}", src, dst_hosts);
     else
-      len = Snprintf(pcap_filter, sizeof(pcap_filter), "dst host %s and (icmp or tcp)",
-                   inet_ntoa(((struct sockaddr_in *)&ss)->sin_addr));
-    if (len < 0 || len >= (int) sizeof(pcap_filter))
-      fatal("ran out of space in pcap filter");
+      pcap_filter = std::format("dst host {} and (icmp or tcp)", src);
 
     /* Compile and apply the filter to the pcap descriptor */
     if (o.debugging)
-      log_write(LOG_PLAIN, "Packet capture filter (device %s): %s\n", Targets[0]->deviceFullName(), pcap_filter);
-    set_pcap_filter(Targets[0]->deviceFullName(), HOS->pd, pcap_filter);
+      log_write(LOG_PLAIN, "Packet capture filter (device %s): %s\n", Targets[0]->deviceFullName(), pcap_filter.c_str());
+    set_pcap_filter(Targets[0]->deviceFullName(), HOS->pd, pcap_filter.c_str());
   }
 
   return;
@@ -438,17 +430,17 @@ static void begin_sniffer(HostOsScan *HOS, std::vector<Target *> &Targets) {
  * reinitializing some variables of the supplied objects and deleting
  * some old information. */
 static void startRound(OsScanInfo *OSI, HostOsScan *HOS, int roundNum) {
-  std::list<HostOsScanInfo *>::iterator hostI;
+  OsScanInfo::HostList::iterator hostI;
   HostOsScanInfo *hsi = NULL;
 
   /* Reinitial some parameters of the scan system. */
   HOS->reInitScanSystem();
 
   for (hostI = OSI->incompleteHosts.begin(); hostI != OSI->incompleteHosts.end(); hostI++) {
-    hsi = *hostI;
+    hsi = hostI->get();
     if (hsi->FPs[roundNum]) {
-      delete hsi->FPs[roundNum];
-      hsi->FPs[roundNum] = NULL;
+      hsi->FPs[roundNum].reset();
+      hsi->FPR->FPs[roundNum] = nullptr;
     }
     hsi->hss->initScanStats();
   }
@@ -456,7 +448,7 @@ static void startRound(OsScanInfo *OSI, HostOsScan *HOS, int roundNum) {
 
 /* Run the sequence generation tests (6 TCP probes sent 100ms apart) */
 static void doSeqTests(OsScanInfo *OSI, HostOsScan *HOS) {
-  std::list<HostOsScanInfo *>::iterator hostI;
+  OsScanInfo::HostList::iterator hostI;
   HostOsScanInfo *hsi = NULL;
   HostOsScanStats *hss = NULL;
   unsigned int unableToSend = 0;  /* # of times in a row that hosts were unable to send probe */
@@ -481,8 +473,8 @@ static void doSeqTests(OsScanInfo *OSI, HostOsScan *HOS) {
 
   /* For each host, build a list of sequence probes to send */
   for (hostI = OSI->incompleteHosts.begin(); hostI != OSI->incompleteHosts.end(); hostI++) {
-    hsi = *hostI;
-    hss = hsi->hss;
+    hsi = hostI->get();
+    hss = hsi->hss.get();
     HOS->buildSeqProbeList(hss);
   }
 
@@ -500,7 +492,7 @@ static void doSeqTests(OsScanInfo *OSI, HostOsScan *HOS) {
 
     if (o.debugging > 2) {
       for (hostI = OSI->incompleteHosts.begin(); hostI != OSI->incompleteHosts.end(); hostI++) {
-        hss = (*hostI)->hss;
+        hss = (*hostI)->hss.get();
         log_write(LOG_PLAIN, "Host %s. ProbesToSend %d: \tProbesActive %d\n",
                   hss->target->targetipstr(), hss->numProbesToSend(),
                   hss->numProbesActive());
@@ -510,7 +502,7 @@ static void doSeqTests(OsScanInfo *OSI, HostOsScan *HOS) {
     /* Send a seq probe to each host. */
     while (unableToSend < OSI->numIncompleteHosts() && HOS->stats->sendOK()) {
       hsi = OSI->nextIncompleteHost();
-      hss = hsi->hss;
+      hss = hsi->hss.get();
       gettimeofday(&now, NULL);
       if (hss->numProbesToSend()>0 && HOS->hostSeqSendOK(hss, NULL)) {
         HOS->sendNextProbe(hss);
@@ -530,7 +522,7 @@ static void doSeqTests(OsScanInfo *OSI, HostOsScan *HOS) {
       TIMEVAL_MSEC_ADD(stime, now, 1000);
 
       for (hostI = OSI->incompleteHosts.begin(); hostI != OSI->incompleteHosts.end(); hostI++) {
-        if (HOS->nextTimeout((*hostI)->hss, &tmptv)) {
+        if (HOS->nextTimeout((*hostI)->hss.get(), &tmptv)) {
           if (TIMEVAL_BEFORE(tmptv, stime))
             stime = tmptv;
         }
@@ -538,7 +530,7 @@ static void doSeqTests(OsScanInfo *OSI, HostOsScan *HOS) {
     } else {
       foundgood = false;
       for (hostI = OSI->incompleteHosts.begin(); hostI != OSI->incompleteHosts.end(); hostI++) {
-        thisHostGood = HOS->hostSeqSendOK((*hostI)->hss, &tmptv);
+        thisHostGood = HOS->hostSeqSendOK((*hostI)->hss.get(), &tmptv);
         if (thisHostGood) {
           stime = tmptv;
           foundgood = true;
@@ -588,7 +580,7 @@ static void doSeqTests(OsScanInfo *OSI, HostOsScan *HOS) {
         continue; /* Not from one of our targets. */
       setTargetMACIfAvailable(hsi->target, &linkhdr, &ss, 0);
 
-      goodResponse = HOS->processResp(hsi->hss, ip, bytes, &rcvdtime);
+      goodResponse = HOS->processResp(hsi->hss.get(), ip, bytes, &rcvdtime);
 
       if (goodResponse)
         expectReplies--;
@@ -601,7 +593,7 @@ static void doSeqTests(OsScanInfo *OSI, HostOsScan *HOS) {
     numProbesLeft = 0;
     for (hostI = OSI->incompleteHosts.begin();
         hostI != OSI->incompleteHosts.end(); hostI++) {
-      hss = (*hostI)->hss;
+      hss = (*hostI)->hss.get();
       HOS->updateActiveSeqProbes(hss);
       numProbesLeft += hss->numProbesToSend();
       numProbesLeft += hss->numProbesActive();
@@ -622,7 +614,7 @@ static void doSeqTests(OsScanInfo *OSI, HostOsScan *HOS) {
 
 /* TCP, UDP, ICMP Tests */
 static void doTUITests(OsScanInfo *OSI, HostOsScan *HOS) {
-  std::list<HostOsScanInfo *>::iterator hostI;
+  OsScanInfo::HostList::iterator hostI;
   HostOsScanInfo *hsi = NULL;
   HostOsScanStats *hss = NULL;
   unsigned int unableToSend; /* # of times in a row that hosts were unable to send probe */
@@ -649,8 +641,8 @@ static void doTUITests(OsScanInfo *OSI, HostOsScan *HOS) {
 
   for (hostI = OSI->incompleteHosts.begin();
       hostI != OSI->incompleteHosts.end(); hostI++) {
-    hsi = *hostI;
-    hss = hsi->hss;
+    hsi = hostI->get();
+    hss = hsi->hss.get();
     HOS->buildTUIProbeList(hss);
   }
 
@@ -671,7 +663,7 @@ static void doTUITests(OsScanInfo *OSI, HostOsScan *HOS) {
     if (o.debugging > 2) {
       for (hostI = OSI->incompleteHosts.begin();
           hostI != OSI->incompleteHosts.end(); hostI++) {
-        hss = (*hostI)->hss;
+        hss = (*hostI)->hss.get();
         log_write(LOG_PLAIN, "Host %s. ProbesToSend %d: \tProbesActive %d\n",
                   hss->target->targetipstr(), hss->numProbesToSend(),
                   hss->numProbesActive());
@@ -680,7 +672,7 @@ static void doTUITests(OsScanInfo *OSI, HostOsScan *HOS) {
 
     while (unableToSend < OSI->numIncompleteHosts() && HOS->stats->sendOK()) {
       hsi = OSI->nextIncompleteHost();
-      hss = hsi->hss;
+      hss = hsi->hss.get();
       gettimeofday(&now, NULL);
       if (hss->numProbesToSend()>0 && HOS->hostSendOK(hss, NULL)) {
         HOS->sendNextProbe(hss);
@@ -701,7 +693,7 @@ static void doTUITests(OsScanInfo *OSI, HostOsScan *HOS) {
 
       for (hostI = OSI->incompleteHosts.begin(); hostI != OSI->incompleteHosts.end();
           hostI++) {
-        if (HOS->nextTimeout((*hostI)->hss, &tmptv)) {
+        if (HOS->nextTimeout((*hostI)->hss.get(), &tmptv)) {
           if (TIMEVAL_BEFORE(tmptv, stime))
             stime = tmptv;
         }
@@ -710,7 +702,7 @@ static void doTUITests(OsScanInfo *OSI, HostOsScan *HOS) {
     else {
       foundgood = false;
       for (hostI = OSI->incompleteHosts.begin(); hostI != OSI->incompleteHosts.end(); hostI++) {
-        thisHostGood = HOS->hostSendOK((*hostI)->hss, &tmptv);
+        thisHostGood = HOS->hostSendOK((*hostI)->hss.get(), &tmptv);
         if (thisHostGood) {
           stime = tmptv;
           foundgood = true;
@@ -759,7 +751,7 @@ static void doTUITests(OsScanInfo *OSI, HostOsScan *HOS) {
         continue; /* Not from one of our targets. */
       setTargetMACIfAvailable(hsi->target, &linkhdr, &ss, 0);
 
-      goodResponse = HOS->processResp(hsi->hss, ip, bytes, &rcvdtime);
+      goodResponse = HOS->processResp(hsi->hss.get(), ip, bytes, &rcvdtime);
 
       if (goodResponse)
         expectReplies--;
@@ -772,7 +764,7 @@ static void doTUITests(OsScanInfo *OSI, HostOsScan *HOS) {
     numProbesLeft = 0;
     for (hostI = OSI->incompleteHosts.begin();
         hostI != OSI->incompleteHosts.end(); hostI++) {
-      hss = (*hostI)->hss;
+      hss = (*hostI)->hss.get();
       HOS->updateActiveTUIProbes(hss);
       numProbesLeft += hss->numProbesToSend();
       numProbesLeft += hss->numProbesActive();
@@ -791,24 +783,24 @@ static void doTUITests(OsScanInfo *OSI, HostOsScan *HOS) {
 
 
 static void endRound(OsScanInfo *OSI, HostOsScan *HOS, int roundNum) {
-  std::list<HostOsScanInfo *>::iterator hostI;
+  OsScanInfo::HostList::iterator hostI;
   HostOsScanInfo *hsi = NULL;
   int distance = -1;
   enum dist_calc_method distance_calculation_method = DIST_METHOD_NONE;
 
   for (hostI = OSI->incompleteHosts.begin(); hostI != OSI->incompleteHosts.end(); hostI++) {
     distance = -1;
-    hsi = *hostI;
+    hsi = hostI->get();
     /* Have to calculate timingRatio before calling makeFP, since that can muck
      * with the seq_send_times array. */
     double tr = hsi->hss->timingRatio();
-    HOS->makeFP(hsi->hss);
+    HOS->makeFP(hsi->hss.get());
 
-    hsi->FPs[roundNum] = hsi->hss->getFP();
-    hsi->FPR->FPs[roundNum] = hsi->FPs[roundNum];
+    hsi->FPs[roundNum] = hsi->hss->takeFP();
+    hsi->FPR->FPs[roundNum] = hsi->FPs[roundNum].get();
     hsi->FPR->numFPs = roundNum + 1;
     hsi->target->FPR->maxTimingRatio = MAX(hsi->target->FPR->maxTimingRatio, tr);
-    match_fingerprint(hsi->FPs[roundNum], &hsi->FP_matches[roundNum],
+    match_fingerprint(hsi->FPs[roundNum].get(), &hsi->FP_matches[roundNum],
                       o.reference_FPs, OSSCAN_GUESS_THRESHOLD);
 
     if (hsi->FP_matches[roundNum].overall_results == OSSCAN_SUCCESS &&
@@ -846,7 +838,7 @@ static void endRound(OsScanInfo *OSI, HostOsScan *HOS, int roundNum) {
 
 
 static void findBestFPs(OsScanInfo *OSI) {
-  std::list<HostOsScanInfo *>::iterator hostI;
+  OsScanInfo::HostList::iterator hostI;
   HostOsScanInfo *hsi = NULL;
   int i;
 
@@ -854,7 +846,7 @@ static void findBestFPs(OsScanInfo *OSI) {
   int bestaccidx;
 
   for (hostI = OSI->incompleteHosts.begin(); hostI != OSI->incompleteHosts.end(); hostI++) {
-    hsi = *hostI;
+    hsi = hostI->get();
     memcpy(&(hsi->target->seq), &hsi->hss->si, sizeof(struct seq_info));
 
     /* Now lets find the best match */
@@ -881,12 +873,12 @@ static void findBestFPs(OsScanInfo *OSI) {
 
 
 static void printFP(OsScanInfo *OSI) {
-  std::list<HostOsScanInfo *>::const_iterator hostI;
+  OsScanInfo::HostList::const_iterator hostI;
   const HostOsScanInfo *hsi = NULL;
   const FingerPrintResultsIPv4 *FPR;
 
   for (hostI = OSI->incompleteHosts.begin(); hostI != OSI->incompleteHosts.end(); hostI++) {
-    hsi = *hostI;
+    hsi = hostI->get();
     FPR = hsi->FPR;
 
     log_write(LOG_NORMAL|LOG_SKID_NOXLT|LOG_STDOUT,
@@ -906,14 +898,14 @@ static void printFP(OsScanInfo *OSI) {
    the maximum number of OS detection tries allowed for it without
    matching, it is transferred to the passed in unMatchedHosts list.
    Returns the number of hosts moved to unMatchedHosts. */
-static int expireUnmatchedHosts(OsScanInfo *OSI, std::list<HostOsScanInfo *> *unMatchedHosts) {
-  std::list<HostOsScanInfo *>::iterator hostI, nextHost;
+static int expireUnmatchedHosts(OsScanInfo *OSI, OsScanInfo::HostList *unMatchedHosts) {
+  OsScanInfo::HostList::iterator hostI, nextHost;
   int hostsRemoved = 0;
   HostOsScanInfo *HOS;
 
   gettimeofday(&now, NULL);
   for (hostI = OSI->incompleteHosts.begin(); hostI != OSI->incompleteHosts.end(); hostI = nextHost) {
-    HOS = *hostI;
+    HOS = hostI->get();
     nextHost = hostI;
     nextHost++;
 
@@ -925,11 +917,10 @@ static int expireUnmatchedHosts(OsScanInfo *OSI, std::list<HostOsScanInfo *> *un
       /* We've done all the OS2 tries we're going to do ... move this
      to unMatchedHosts */
       HOS->target->stopTimeOutClock(&now);
-      OSI->incompleteHosts.erase(hostI);
+      unMatchedHosts->splice(unMatchedHosts->end(), OSI->incompleteHosts, hostI);
       /* We need to adjust nextI if necessary */
       OSI->resetHostIterator();
       hostsRemoved++;
-      unMatchedHosts->push_back(HOS);
     }
   }
   return hostsRemoved;
@@ -978,10 +969,7 @@ const char *OFProbe::typestr() const {
  ******************************************************************************/
 
 HostOsScanStats::HostOsScanStats(Target * t) {
-  int i;
-
   target = t;
-  FP = NULL;
 
   memset(&si, 0, sizeof(si));
   memset(&ipid, 0, sizeof(ipid));
@@ -1002,9 +990,10 @@ HostOsScanStats::HostOsScanStats(Target * t) {
   timing.num_updates = 0;
   gettimeofday(&timing.last_drop, NULL);
 
-  for (i = 0; i < NUM_FPTESTS; i++)
-    FPtests[i] = NULL;
-  for (i = 0; i < 6; i++) {
+  for (auto &test : FPtests) {
+    test.reset();
+  }
+  for (int i = 0; i < 6; i++) {
     TOps_AVs[i] = NULL;
     TWin_AVs[i] = NULL;
   }
@@ -1017,25 +1006,8 @@ HostOsScanStats::HostOsScanStats(Target * t) {
 
 
 HostOsScanStats::~HostOsScanStats() {
-  int i;
-
-  for (i = 0; i < NUM_FPTESTS; i++) {
-    if (FPtests[i] != NULL) {
-      delete FPtests[i];
-      FPtests[i] = NULL;
-    }
-  }
-
-  while (!probesToSend.empty()) {
-    delete probesToSend.front();
-    probesToSend.pop_front();
-  }
-
-  while (!probesActive.empty()) {
-    delete probesActive.front();
-    probesActive.pop_front();
-  }
-
+  probesToSend.clear();
+  probesActive.clear();
   if (icmpEchoReply) free(icmpEchoReply);
 }
 
@@ -1133,12 +1105,9 @@ void HostOsScanStats::initScanStats() {
     closedUDPPort = (get_random_uint() % 14781) + 30000;
   }
 
-  FP = NULL;
-  for (i = 0; i < NUM_FPTESTS; i++) {
-    if (FPtests[i] != NULL) {
-      delete FPtests[i];
-      FPtests[i] = NULL;
-    }
+  FP.reset();
+  for (auto &test : FPtests) {
+    test.reset();
   }
   for (i = 0; i < 6; i++) {
     TOps_AVs[i] = NULL;
@@ -1188,29 +1157,25 @@ struct eth_nfo *HostOsScanStats::fill_eth_nfo(struct eth_nfo *eth, netutil_eth_t
 
 /* Add a probe to the probe list. */
 void HostOsScanStats::addNewProbe(OFProbeType type, int subid) {
-  OFProbe *probe = new OFProbe();
+  auto probe = std::make_unique<OFProbe>();
   probe->type = type;
   probe->subid = subid;
-  probesToSend.push_back(probe);
+  probesToSend.push_back(std::move(probe));
 }
 
 
 /* Remove a probe from the probesActive. */
-void HostOsScanStats::removeActiveProbe(std::list<OFProbe *>::iterator probeI) {
-  OFProbe *probe = *probeI;
+void HostOsScanStats::removeActiveProbe(HostOsScanStats::ProbeIterator probeI) {
   probesActive.erase(probeI);
-  delete probe;
 }
 
 
 /* Get an active probe from active probe list identified by probe type
    and subid.  Returns probesActive.end() if there isn't one */
-std::list<OFProbe *>::iterator HostOsScanStats::getActiveProbe(OFProbeType type, int subid) {
-  std::list<OFProbe *>::iterator probeI;
-  OFProbe *probe = NULL;
-
+HostOsScanStats::ProbeIterator HostOsScanStats::getActiveProbe(OFProbeType type, int subid) {
+  HostOsScanStats::ProbeIterator probeI;
   for (probeI = probesActive.begin(); probeI != probesActive.end(); probeI++) {
-    probe = *probeI;
+    auto *probe = probeI->get();
     if (probe->type == type && probe->subid == subid)
       break;
   }
@@ -1227,16 +1192,14 @@ std::list<OFProbe *>::iterator HostOsScanStats::getActiveProbe(OFProbeType type,
 
 
 /* Move a probe from probesToSend to probesActive. */
-void HostOsScanStats::moveProbeToActiveList(std::list<OFProbe *>::iterator probeI) {
-  probesActive.push_back(*probeI);
-  probesToSend.erase(probeI);
+void HostOsScanStats::moveProbeToActiveList(HostOsScanStats::ProbeIterator probeI) {
+  probesActive.splice(probesActive.end(), probesToSend, probeI);
 }
 
 
 /* Move a probe from probesActive to probesToSend. */
-void HostOsScanStats::moveProbeToUnSendList(std::list<OFProbe *>::iterator probeI) {
-  probesToSend.push_back(*probeI);
-  probesActive.erase(probeI);
+void HostOsScanStats::moveProbeToUnSendList(HostOsScanStats::ProbeIterator probeI) {
+  probesToSend.splice(probesToSend.end(), probesActive, probeI);
 }
 
 
@@ -1266,7 +1229,7 @@ double HostOsScanStats::timingRatio() const {
 bool HostOsScan::nextTimeout(HostOsScanStats *hss, struct timeval *when) const {
   assert(hss);
   struct timeval probe_to, earliest_to;
-  std::list<OFProbe *>::const_iterator probeI;
+  HostOsScanStats::ProbeList::const_iterator probeI;
   bool firstgood = true;
 
   assert(when);
@@ -1361,7 +1324,7 @@ HostOsScan::HostOsScan(Target *t) {
 
   reInitScanSystem();
 
-  stats = new ScanStats();
+  stats = std::make_unique<ScanStats>();
 }
 
 
@@ -1375,7 +1338,7 @@ HostOsScan::~HostOsScan() {
     pd = NULL;
   }
   /* No need to close ethsd due to caching. */
-  delete stats;
+  stats.reset();
 }
 
 
@@ -1419,14 +1382,14 @@ void HostOsScan::buildSeqProbeList(HostOsScanStats *hss) {
  * timed out. */
 void HostOsScan::updateActiveSeqProbes(HostOsScanStats *hss) {
   assert(hss);
-  std::list<OFProbe *>::iterator probeI, nxt;
+  HostOsScanStats::ProbeIterator probeI, nxt;
   OFProbe *probe = NULL;
   long usec_to = timeProbeTimeout(hss);
 
   for (probeI = hss->probesActive.begin(); probeI != hss->probesActive.end(); probeI = nxt) {
     nxt = probeI;
     nxt++;
-    probe = *probeI;
+    probe = probeI->get();
 
     /* Is the probe timedout? */
     if (TIMEVAL_SUBTRACT(now, probe->sent) > usec_to) {
@@ -1502,14 +1465,14 @@ void HostOsScan::buildTUIProbeList(HostOsScanStats *hss) {
  * 2) Move timedout probes to probeNeedToSend; */
 void HostOsScan::updateActiveTUIProbes(HostOsScanStats *hss) {
   assert(hss);
-  std::list<OFProbe *>::iterator probeI, nxt;
+  HostOsScanStats::ProbeIterator probeI, nxt;
   OFProbe *probe = NULL;
   long usec_to = timeProbeTimeout(hss);
 
   for (probeI = hss->probesActive.begin(); probeI != hss->probesActive.end(); probeI = nxt) {
     nxt = probeI;
     nxt++;
-    probe = *probeI;
+    probe = probeI->get();
 
     if (TIMEVAL_SUBTRACT(now, probe->sent) > usec_to) {
       if (probe->tryno >= 3) {
@@ -1534,7 +1497,7 @@ void HostOsScan::updateActiveTUIProbes(HostOsScanStats *hss) {
  * return true. */
 bool HostOsScan::hostSendOK(HostOsScanStats *hss, struct timeval *when) const {
   assert(hss);
-  std::list<OFProbe *>::const_iterator probeI;
+  HostOsScanStats::ProbeList::const_iterator probeI;
   int packTime;
   struct timeval probe_to, earliest_to, sendTime;
   long tdiff;
@@ -1604,7 +1567,7 @@ bool HostOsScan::hostSendOK(HostOsScanStats *hss, struct timeval *when) const {
  * false; else, fill it with now and return true. */
 bool HostOsScan::hostSeqSendOK(HostOsScanStats *hss, struct timeval *when) const {
   assert(hss);
-  std::list<OFProbe *>::const_iterator probeI;
+  HostOsScanStats::ProbeList::const_iterator probeI;
   int packTime = 0, maxWait = 0;
   struct timeval probe_to, earliest_to, sendTime;
   long tdiff;
@@ -1686,7 +1649,7 @@ unsigned long HostOsScan::timeProbeTimeout(HostOsScanStats *hss) const {
 
 void HostOsScan::sendNextProbe(HostOsScanStats *hss) {
   assert(hss);
-  std::list<OFProbe *>::iterator probeI;
+  HostOsScanStats::ProbeIterator probeI;
   OFProbe *probe = NULL;
 
   if (hss->probesToSend.empty())
@@ -1697,7 +1660,7 @@ void HostOsScan::sendNextProbe(HostOsScanStats *hss) {
   }
 
   probeI = hss->probesToSend.begin();
-  probe = *probeI;
+  probe = probeI->get();
 
   switch (probe->type) {
   case OFP_TSEQ:
@@ -1752,11 +1715,11 @@ void HostOsScan::sendTSeqProbe(HostOsScanStats *hss, int probeNo) {
   if (hss->openTCPPort == -1)
     return;
 
-  send_tcp_probe(hss, o.ttl, false, NULL, 0,
+  send_tcp_probe(hss, o.ttl, false, {},
                  tcpPortBase + probeNo, hss->openTCPPort,
                  tcpSeqBase + probeNo, tcpAck,
                  0, TH_SYN, prbWindowSz[probeNo], 0,
-                 prbOpts[probeNo].val, prbOpts[probeNo].len, NULL, 0);
+                 std::span<const u8>(prbOpts[probeNo].val, prbOpts[probeNo].len), {});
 
   hss->seq_send_times[probeNo] = now;
 }
@@ -1769,11 +1732,11 @@ void HostOsScan::sendTOpsProbe(HostOsScanStats *hss, int probeNo) {
   if (hss->openTCPPort == -1)
     return;
 
-  send_tcp_probe(hss, o.ttl, false, NULL, 0,
+  send_tcp_probe(hss, o.ttl, false, {},
                  tcpPortBase + NUM_SEQ_SAMPLES + probeNo, hss->openTCPPort,
                  tcpSeqBase, tcpAck,
                  0, TH_SYN, prbWindowSz[probeNo], 0,
-                 prbOpts[probeNo].val, prbOpts[probeNo].len, NULL, 0);
+                 std::span<const u8>(prbOpts[probeNo].val, prbOpts[probeNo].len), {});
 }
 
 
@@ -1783,11 +1746,11 @@ void HostOsScan::sendTEcnProbe(HostOsScanStats *hss) {
   if (hss->openTCPPort == -1)
     return;
 
-  send_tcp_probe(hss, o.ttl, false, NULL, 0,
+  send_tcp_probe(hss, o.ttl, false, {},
                  tcpPortBase + NUM_SEQ_SAMPLES + 6, hss->openTCPPort,
                  tcpSeqBase, 0,
                  8, TH_CWR|TH_ECE|TH_SYN, prbWindowSz[6], 63477,
-                 prbOpts[6].val, prbOpts[6].len, NULL, 0);
+                 std::span<const u8>(prbOpts[6].val, prbOpts[6].len), {});
 }
 
 
@@ -1804,65 +1767,65 @@ void HostOsScan::sendT1_7Probe(HostOsScanStats *hss, int probeNo) {
        as the first probe sent by sendTSeqProbe. */
     if (hss->openTCPPort == -1)
       return;
-    send_tcp_probe(hss, o.ttl, false, NULL, 0,
+    send_tcp_probe(hss, o.ttl, false, {},
                    port_base, hss->openTCPPort,
                    tcpSeqBase, tcpAck,
                    0, TH_SYN, prbWindowSz[0], 0,
-                   prbOpts[0].val, prbOpts[0].len, NULL, 0);
+                   std::span<const u8>(prbOpts[0].val, prbOpts[0].len), {});
     break;
   case 1: /* T2 */
     if (hss->openTCPPort == -1)
       return;
-    send_tcp_probe(hss, o.ttl, true, NULL, 0,
+    send_tcp_probe(hss, o.ttl, true, {},
                    port_base + 1, hss->openTCPPort,
                    tcpSeqBase, tcpAck,
                    0, 0, prbWindowSz[7], 0,
-                   prbOpts[7].val, prbOpts[7].len, NULL, 0);
+                   std::span<const u8>(prbOpts[7].val, prbOpts[7].len), {});
     break;
   case 2: /* T3 */
     if (hss->openTCPPort == -1)
       return;
-    send_tcp_probe(hss, o.ttl, false, NULL, 0,
+    send_tcp_probe(hss, o.ttl, false, {},
                    port_base + 2, hss->openTCPPort,
                    tcpSeqBase, tcpAck,
                    0, TH_SYN|TH_FIN|TH_URG|TH_PUSH, prbWindowSz[8], 0,
-                   prbOpts[8].val, prbOpts[8].len, NULL, 0);
+                   std::span<const u8>(prbOpts[8].val, prbOpts[8].len), {});
     break;
   case 3: /* T4 */
     if (hss->openTCPPort == -1)
       return;
-    send_tcp_probe(hss, o.ttl, true, NULL, 0,
+    send_tcp_probe(hss, o.ttl, true, {},
                    port_base + 3, hss->openTCPPort,
                    tcpSeqBase, tcpAck,
                    0, TH_ACK, prbWindowSz[9], 0,
-                   prbOpts[9].val, prbOpts[9].len, NULL, 0);
+                   std::span<const u8>(prbOpts[9].val, prbOpts[9].len), {});
     break;
   case 4: /* T5 */
     if (hss->closedTCPPort == -1)
       return;
-    send_tcp_probe(hss, o.ttl, false, NULL, 0,
+    send_tcp_probe(hss, o.ttl, false, {},
                    port_base + 4, hss->closedTCPPort,
                    tcpSeqBase, tcpAck,
                    0, TH_SYN, prbWindowSz[10], 0,
-                   prbOpts[10].val, prbOpts[10].len, NULL, 0);
+                   std::span<const u8>(prbOpts[10].val, prbOpts[10].len), {});
     break;
   case 5: /* T6 */
     if (hss->closedTCPPort == -1)
       return;
-    send_tcp_probe(hss, o.ttl, true, NULL, 0,
+    send_tcp_probe(hss, o.ttl, true, {},
                    port_base + 5, hss->closedTCPPort,
                    tcpSeqBase, tcpAck,
                    0, TH_ACK, prbWindowSz[11], 0,
-                   prbOpts[11].val, prbOpts[11].len, NULL, 0);
+                   std::span<const u8>(prbOpts[11].val, prbOpts[11].len), {});
     break;
   case 6: /* T7 */
     if (hss->closedTCPPort == -1)
       return;
-    send_tcp_probe(hss, o.ttl, false, NULL, 0,
+    send_tcp_probe(hss, o.ttl, false, {},
                    port_base + 6, hss->closedTCPPort,
                    tcpSeqBase, tcpAck,
                    0, TH_FIN|TH_PUSH|TH_URG, prbWindowSz[12], 0,
-                   prbOpts[12].val, prbOpts[12].len, NULL, 0);
+                   std::span<const u8>(prbOpts[12].val, prbOpts[12].len), {});
   }
 }
 
@@ -1895,7 +1858,7 @@ bool HostOsScan::processResp(HostOsScanStats *hss, const struct ip *ip, unsigned
   const struct icmp *icmp;
   int testno;
   bool isPktUseful = false;
-  std::list<OFProbe *>::iterator probeI;
+  HostOsScanStats::ProbeIterator probeI;
   OFProbe *probe;
 
   if (len < 20 || len < (4 * ip->ip_hl) + 4U)
@@ -2003,7 +1966,7 @@ bool HostOsScan::processResp(HostOsScanStats *hss, const struct ip *ip, unsigned
   }
 
   if (isPktUseful && probeI != hss->probesActive.end()) {
-    probe = *probeI;
+    probe = probeI->get();
 
     if (rcvdtime)
       adjust_times(hss, probe, rcvdtime);
@@ -2047,7 +2010,7 @@ void HostOsScan::makeFP(HostOsScanStats *hss) {
       /* We create a Resp (response) attribute with value of N (no) because
          it is important here to note whether responses were or were not
          received */
-      hss->FPtests[i] = new FingerTest(INT2ID(i), *o.reference_FPs->MatchPoints);
+      hss->FPtests[i] = std::make_unique<FingerTest>(INT2ID(i), *o.reference_FPs->MatchPoints);
       hss->FPtests[i]->setAVal("R", "N");
     }
     else if (hss->FPtests[i]) {
@@ -2078,7 +2041,7 @@ void HostOsScan::makeFP(HostOsScanStats *hss) {
   }
 
   /* Link them up. */
-  hss->FP = new FingerPrint;
+  hss->FP = std::make_unique<FingerPrint>();
   for (i = 0; i < NUM_FPTESTS; i++) {
     if (hss->FPtests[i] == NULL)
       continue;
@@ -2090,19 +2053,20 @@ void HostOsScan::makeFP(HostOsScanStats *hss) {
 /* Send a TCP probe. This takes care of decoys and filling in Ethernet
  * addresses if necessary. Used for the SEQ, OPS, WIN, ECN, and T1-T7 probes. */
 int HostOsScan::send_tcp_probe(HostOsScanStats *hss,
-                               int ttl, bool df, u8* ipopt, int ipoptlen,
+                               int ttl, bool df, std::span<const u8> ipopt,
                                u16 sport, u16 dport, u32 seq, u32 ack,
                                u8 reserved, u8 flags, u16 window, u16 urp,
-                               u8 *options, int optlen,
-                               char *data, u16 datalen) {
+                               std::span<const u8> options,
+                               std::span<const char> data) {
   struct eth_nfo eth, *ethptr;
 
   ethptr = hss->fill_eth_nfo(&eth, ethsd);
 
   return send_tcp_raw_decoys(rawsd, ethptr, hss->target->v4hostip(),
-                             ttl, df, ipopt, ipoptlen, sport, dport, seq, ack,
+                             ttl, df, const_cast<u8 *>(ipopt.data()), static_cast<int>(ipopt.size()), sport, dport, seq, ack,
                              reserved, flags, window, urp,
-                             options, optlen, data, datalen);
+                             const_cast<u8 *>(options.data()), static_cast<int>(options.size()),
+                             const_cast<char *>(data.data()), static_cast<u16>(data.size()));
 }
 
 
@@ -2306,7 +2270,7 @@ void HostOsScan::makeTSeqFP(HostOsScanStats *hss) {
   int good_tcp_ipid_num, good_tcp_closed_ipid_num, good_icmp_ipid_num;
   int tsnewval = 0;
 
-  hss->FP_TSeq = new FingerTest(FingerPrintDef::SEQ, *o.reference_FPs->MatchPoints);
+  hss->FP_TSeq = std::make_unique<FingerTest>(FingerPrintDef::SEQ, *o.reference_FPs->MatchPoints);
   FingerTest &test = *hss->FP_TSeq;
 
   /* Now we make sure there are no gaps in our response array ... */
@@ -2572,7 +2536,7 @@ void HostOsScan::makeTOpsFP(HostOsScanStats *hss) {
     return;
   }
 
-  hss->FP_TOps = new FingerTest(FingerPrintDef::OPS, *o.reference_FPs->MatchPoints);
+  hss->FP_TOps = std::make_unique<FingerTest>(FingerPrintDef::OPS, *o.reference_FPs->MatchPoints);
   std::vector<const char *> &results = *hss->FP_TOps->results;
 
   for (i = 0; i < n; i++)
@@ -2597,7 +2561,7 @@ void HostOsScan::makeTWinFP(HostOsScanStats *hss) {
     return;
   }
 
-  hss->FP_TWin = new FingerTest(FingerPrintDef::WIN, *o.reference_FPs->MatchPoints);
+  hss->FP_TWin = std::make_unique<FingerTest>(FingerPrintDef::WIN, *o.reference_FPs->MatchPoints);
   std::vector<const char *> &results = *hss->FP_TWin->results;
 
   for (i = 0; i < n; i++)
@@ -2679,7 +2643,7 @@ bool HostOsScan::processTOpsResp(HostOsScanStats *hss, const struct tcp_hdr *tcp
   if (hss->FP_TOps || hss->TOps_AVs[replyNo])
     return false;
 
-  int opsParseResult = get_tcpopt_string(tcp, this->tcpMss, ops_buf, sizeof(ops_buf));
+  int opsParseResult = get_tcpopt_string(tcp, this->tcpMss, std::span<char>(ops_buf));
 
   if (opsParseResult <= 0) {
     if (opsParseResult < 0 && o.debugging)
@@ -2718,7 +2682,7 @@ bool HostOsScan::processTEcnResp(HostOsScanStats *hss, const struct ip *ip) {
     return false;
 
   /* Create the Avals */
-  hss->FP_TEcn = new FingerTest(FingerPrintDef::ECN, *o.reference_FPs->MatchPoints);
+  hss->FP_TEcn = std::make_unique<FingerTest>(FingerPrintDef::ECN, *o.reference_FPs->MatchPoints);
   FingerTest &test = *hss->FP_TEcn;
 
   test.setAVal("R", "Y");
@@ -2736,7 +2700,7 @@ bool HostOsScan::processTEcnResp(HostOsScanStats *hss, const struct ip *ip) {
   test.setAVal("W", hss->target->FPR->cp_hex(ntohs(tcp->th_win)));
 
   /* Now for the TCP options ... */
-  int opsParseResult = get_tcpopt_string(tcp, this->tcpMss, ops_buf, sizeof(ops_buf));
+  int opsParseResult = get_tcpopt_string(tcp, this->tcpMss, std::span<char>(ops_buf));
 
   if (opsParseResult <= 0) {
     if (opsParseResult < 0 && o.debugging)
@@ -2794,7 +2758,7 @@ bool HostOsScan::processT1_7Resp(HostOsScanStats *hss, const struct ip *ip, int 
   if (hss->FPtests[FP_T1_7_OFF + replyNo])
     return false;
 
-  hss->FPtests[FP_T1_7_OFF + replyNo] = new FingerTest(testid, *o.reference_FPs->MatchPoints);
+  hss->FPtests[FP_T1_7_OFF + replyNo] = std::make_unique<FingerTest>(testid, *o.reference_FPs->MatchPoints);
   FingerTest &test = *hss->FPtests[FP_T1_7_OFF + replyNo];
 
   /* First we give the "response" flag to say we did actually receive
@@ -2879,7 +2843,7 @@ bool HostOsScan::processT1_7Resp(HostOsScanStats *hss, const struct ip *ip, int 
     char ops_buf[256];
 
     /* Now for the TCP options ... */
-    int opsParseResult = get_tcpopt_string(tcp, this->tcpMss, ops_buf, sizeof(ops_buf));
+    int opsParseResult = get_tcpopt_string(tcp, this->tcpMss, std::span<char>(ops_buf));
     if (opsParseResult <= 0) {
       if (opsParseResult < 0 && o.debugging)
         error("Option parse error for T%d response from %s.", replyNo, hss->target->targetipstr());
@@ -2945,7 +2909,7 @@ bool HostOsScan::processTUdpResp(HostOsScanStats *hss, const struct ip *ip) {
     return false;
   }
 
-  hss->FP_TUdp = new FingerTest(FingerPrintDef::U1, *o.reference_FPs->MatchPoints);
+  hss->FP_TUdp = std::make_unique<FingerTest>(FingerPrintDef::U1, *o.reference_FPs->MatchPoints);
   FingerTest &test = *hss->FP_TUdp;
 
   /* First of all, if we got this far the response was yes */
@@ -3073,7 +3037,7 @@ bool HostOsScan::processTIcmpResp(HostOsScanStats *hss, const struct ip *ip, int
 
   assert(icmp1->icmp_type == 0 && icmp2->icmp_type == 0);
 
-  hss->FP_TIcmp= new FingerTest(FingerPrintDef::IE, *o.reference_FPs->MatchPoints);
+  hss->FP_TIcmp= std::make_unique<FingerTest>(FingerPrintDef::IE, *o.reference_FPs->MatchPoints);
   FingerTest &test = *hss->FP_TIcmp;
 
   test.setAVal("R", "Y");
@@ -3125,15 +3089,16 @@ bool HostOsScan::processTIcmpResp(HostOsScanStats *hss, const struct ip *ip, int
 }
 
 
-int HostOsScan::get_tcpopt_string(const struct tcp_hdr *tcp, int mss, char *result, int maxlen) const {
+int HostOsScan::get_tcpopt_string(const struct tcp_hdr *tcp, int mss, std::span<char> result) const {
   char *p;
   const char *q;
   u16 tmpshort;
   u32 tmpword;
   int length;
   int opcode;
+  const int maxlen = static_cast<int>(result.size());
 
-  p = result;
+  p = result.data();
   length = (tcp->th_off * 4) - sizeof(struct tcp_hdr);
   q = ((char *)tcp) + sizeof(struct tcp_hdr);
 
@@ -3145,7 +3110,7 @@ int HostOsScan::get_tcpopt_string(const struct tcp_hdr *tcp, int mss, char *resu
   /* Be aware of the max increment value for p in parsing,
    * now is 5 = strlen("Mxxxx") <-> MSS Option
    */
-  while (length > 0 && (p - result) < (maxlen - 5)) {
+  while (length > 0 && (p - result.data()) < (maxlen - 5)) {
     opcode = *q++;
     if (!opcode) { /* End of List */
       *p++ = 'L';
@@ -3161,8 +3126,7 @@ int HostOsScan::get_tcpopt_string(const struct tcp_hdr *tcp, int mss, char *resu
       memcpy(&tmpshort, q, 2);
       /*  if (ntohs(tmpshort) == mss) */
       /*    *p++ = 'E'; */
-      sprintf(p, "%hX", ntohs(tmpshort));
-      p += strlen(p); /* max movement of p is 4 (0xFFFF) */
+      p = std::format_to(p, "{:X}", ntohs(tmpshort)); /* max movement of p is 4 (0xFFFF) */
       q += 2;
       length -= 4;
     } else if (opcode == 3) { /* Window Scale */
@@ -3170,8 +3134,7 @@ int HostOsScan::get_tcpopt_string(const struct tcp_hdr *tcp, int mss, char *resu
         break; /* Window Scale option has 3 bytes */
       *p++ = 'W';
       q++;
-      snprintf(p, length, "%hhX", *((u8*)q));
-      p += strlen(p); /* max movement of p is 2 (max WScale value is 0xFF) */
+      p = std::format_to(p, "{:X}", *((u8*)q)); /* max movement of p is 2 (max WScale value is 0xFF) */
       q++;
       length -= 3;
     } else if (opcode == 4) { /* SACK permitted */
@@ -3206,12 +3169,12 @@ int HostOsScan::get_tcpopt_string(const struct tcp_hdr *tcp, int mss, char *resu
      *  1. At least one option is not correct. (Eg. Should have 4 bytes but only has 3 bytes left).
      *  2. The option string is too long.
      */
-    *result = '\0';
+    *result.data() = '\0';
     return -1;
   }
 
   *p = '\0';
-  return p - result;
+  return static_cast<int>(p - result.data());
 }
 
 
@@ -3223,8 +3186,8 @@ HostOsScanInfo::HostOsScanInfo(Target *t, OsScanInfo *OsSI) {
   target = t;
   OSI = OsSI;
 
-  FPs = (FingerPrint **) safe_zalloc(o.maxOSTries() * sizeof(FingerPrint *));
-  FP_matches = new FingerPrintResultsIPv4[o.maxOSTries()];
+  FPs.resize(o.maxOSTries());
+  FP_matches.resize(o.maxOSTries());
   timedOut = false;
   isCompleted = false;
 
@@ -3234,14 +3197,12 @@ HostOsScanInfo::HostOsScanInfo(Target *t, OsScanInfo *OsSI) {
   }
   target->osscanSetFlag(OS_PERF);
 
-  hss = new HostOsScanStats(t);
+  hss = std::make_unique<HostOsScanStats>(t);
 }
 
 
 HostOsScanInfo::~HostOsScanInfo() {
-  delete hss;
-  free(FPs);
-  delete[] FP_matches;
+  hss.reset();
 }
 
 
@@ -3250,8 +3211,6 @@ HostOsScanInfo::~HostOsScanInfo() {
  ******************************************************************************/
 
 OsScanInfo::OsScanInfo(std::vector<Target *> &Targets) {
-  unsigned int targetno;
-  HostOsScanInfo *hsi;
   int num_timedout = 0;
 
   gettimeofday(&now, NULL);
@@ -3259,7 +3218,7 @@ OsScanInfo::OsScanInfo(std::vector<Target *> &Targets) {
   numInitialTargets = 0;
 
   /* build up incompleteHosts list */
-  for (targetno = 0; targetno < Targets.size(); targetno++) {
+  for (size_t targetno = 0; targetno < Targets.size(); targetno++) {
     /* check if Targets[targetno] is good to be scanned
      * if yes, append it to the list
      */
@@ -3280,8 +3239,7 @@ OsScanInfo::OsScanInfo(std::vector<Target *> &Targets) {
       }
     }
 
-    hsi = new HostOsScanInfo(Targets[targetno], this);
-    incompleteHosts.push_back(hsi);
+    incompleteHosts.push_back(std::make_unique<HostOsScanInfo>(Targets[targetno], this));
     numInitialTargets++;
   }
 
@@ -3291,17 +3249,14 @@ OsScanInfo::OsScanInfo(std::vector<Target *> &Targets) {
 
 OsScanInfo::~OsScanInfo()
 {
-  while (!incompleteHosts.empty()) {
-    delete incompleteHosts.front();
-    incompleteHosts.pop_front();
-  }
+  incompleteHosts.clear();
 }
 
 
 /* Find a HostScanStats by IP its address in the incomplete list.  Returns NULL if
    none are found. */
 HostOsScanInfo *OsScanInfo::findIncompleteHost(const struct sockaddr_storage *ss) {
-  std::list<HostOsScanInfo *>::iterator hostI;
+  OsScanInfo::HostList::iterator hostI;
   const struct sockaddr_in *sin = (struct sockaddr_in *) ss;
 
   if (sin->sin_family != AF_INET)
@@ -3309,7 +3264,7 @@ HostOsScanInfo *OsScanInfo::findIncompleteHost(const struct sockaddr_storage *ss
 
   for (hostI = incompleteHosts.begin(); hostI != incompleteHosts.end(); hostI++) {
     if ((*hostI)->target->v4hostip()->s_addr == sin->sin_addr.s_addr)
-      return *hostI;
+      return hostI->get();
   }
   return NULL;
 }
@@ -3325,7 +3280,7 @@ HostOsScanInfo *OsScanInfo::nextIncompleteHost() {
   if (incompleteHosts.empty())
     return NULL;
 
-  nxt = *nextI;
+  nxt = nextI->get();
   nextI++;
   if (nextI == incompleteHosts.end())
     nextI = incompleteHosts.begin();
@@ -3337,7 +3292,7 @@ HostOsScanInfo *OsScanInfo::nextIncompleteHost() {
 /* Removes any hosts that have completed their scans from the incompleteHosts
    list.  Returns the number of hosts removed. */
 int OsScanInfo::removeCompletedHosts() {
-  std::list<HostOsScanInfo *>::iterator hostI, nxt;
+  OsScanInfo::HostList::iterator hostI, nxt;
   HostOsScanInfo *hsi = NULL;
   int hostsRemoved = 0;
   bool timedout = false;
@@ -3346,7 +3301,7 @@ int OsScanInfo::removeCompletedHosts() {
       hostI = nxt) {
     nxt = hostI;
     nxt++;
-    hsi = *hostI;
+    hsi = hostI->get();
     timedout = hsi->target->timedOut(&now);
     if (hsi->isCompleted || timedout) {
       /* A host to remove!  First adjust nextI appropriately */
@@ -3371,7 +3326,6 @@ int OsScanInfo::removeCompletedHosts() {
       incompleteHosts.erase(hostI);
       hostsRemoved++;
       hsi->target->stopTimeOutClock(&now);
-      delete hsi;
     }
   }
   return hostsRemoved;
@@ -3443,7 +3397,7 @@ int OSScan::os_scan_ipv4(std::vector<Target *> &Targets) {
   int itry = 0;
   /* Hosts which haven't matched and have been removed from incompleteHosts because
    * they have exceeded the number of retransmissions the host is allowed. */
-  std::list<HostOsScanInfo *> unMatchedHosts;
+  OsScanInfo::HostList unMatchedHosts;
 
   /* Check we have at least one target*/
   if (Targets.size() == 0) {
@@ -3477,7 +3431,10 @@ int OSScan::os_scan_ipv4(std::vector<Target *> &Targets) {
       bool plural = (OSI.numIncompleteHosts() != 1);
       if (!plural) {
         (*(OSI.incompleteHosts.begin()))->target->NameIP(targetstr, sizeof(targetstr));
-      } else Snprintf(targetstr, sizeof(targetstr), "%d hosts", (int) OSI.numIncompleteHosts());
+      } else {
+        const auto target_count = std::format("{} hosts", static_cast<int>(OSI.numIncompleteHosts()));
+        Strncpy(targetstr, target_count.c_str(), sizeof(targetstr));
+      }
       log_write(LOG_STDOUT, "%s OS detection (try #%d) against %s\n", (itry == 0)? "Initiating" : "Retrying", itry + 1, targetstr);
       log_flush_all();
     }

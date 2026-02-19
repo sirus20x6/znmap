@@ -1,0 +1,40 @@
+#ifndef CONFIG_H
+#define CONFIG_H
+
+#mesondefine HAVE_STRUCT_IP
+#mesondefine HAVE_STRUCT_ICMP
+#mesondefine HAVE_IP_IP_SUM
+
+#mesondefine STDC_HEADERS
+#mesondefine HAVE_UNISTD_H
+#mesondefine HAVE_STRING_H
+#mesondefine HAVE_STRINGS_H
+#mesondefine HAVE_PWD_H
+
+#mesondefine HAVE_STRERROR
+#mesondefine HAVE_STDINT_H
+#mesondefine HAVE_LINUX_RTNETLINK_H
+#mesondefine HAVE_SYS_STAT_H
+#mesondefine HAVE_NET_IF_H
+#mesondefine HAVE_FCNTL_H
+#mesondefine HAVE_TERMIOS_H
+#mesondefine HAVE_SYS_TIME_H
+
+#mesondefine HAVE_OPENSSL
+#mesondefine HAVE_LIBSSH2
+#mesondefine HAVE_LIBZ
+
+#mesondefine LINUX
+
+#mesondefine HAVE_IPV6_IPPROTO_RAW
+#mesondefine HAVE_PCAP_SET_IMMEDIATE_MODE
+
+#mesondefine HAVE_LUA_H
+
+#mesondefine DNET_INCLUDED
+#mesondefine HAVE_SIGNAL
+
+/* Always set on modern systems */
+#define recvfrom6_t socklen_t
+
+#endif /* CONFIG_H */

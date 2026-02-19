@@ -91,6 +91,7 @@
 #include "scan_lists.h"
 #include "payload.h"
 #include "multicast_discovery.h"
+#include "pg_output.h"
 
 #ifndef NOLUA
 #include "nse_main.h"
@@ -129,6 +130,9 @@
 #else
 #include "libdnet-stripped/include/config.h"
 #endif
+#ifndef VERSION
+#define VERSION NMAP_VERSION
+#endif
 #define DNET_VERSION VERSION
 
 #ifdef LINUX
@@ -138,7 +142,10 @@
 
 #include <string>
 #include <sstream>
+#include <span>
 #include <vector>
+#include <algorithm>
+#include <ranges>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -151,7 +158,7 @@ extern NmapOps o;  /* option structure */
 static void display_nmap_version();
 
 /* A mechanism to save argv[0] for code that requires that. */
-static const char *program_name = NULL;
+static const char *program_name = nullptr;
 
 void set_program_name(const char *name) {
   program_name = name;
@@ -164,7 +171,7 @@ static const char *get_program_name(void) {
 /* parse the --scanflags argument.  It can be a number >=0 or a string consisting of TCP flag names like "URGPSHFIN".  Returns -1 if the argument is invalid. */
 static int parse_scanflags(char *arg) {
   int flagval = 0;
-  char *end = NULL;
+  char *end = nullptr;
 
   if (isdigit((int) (unsigned char) arg[0])) {
     flagval = strtol(arg, &end, 0);
@@ -333,13 +340,10 @@ static void check_setugid(void) {
 static void insert_port_into_merge_list(unsigned short *mlist,
                                         int *merged_port_count,
                                         unsigned short p) {
-  int i;
-  // make sure the port isn't already in the list
-  for (i = 0; i < *merged_port_count; i++) {
-    if (mlist[i] == p) {
-      return;
-    }
-  }
+  const auto existing_ports =
+      std::span<unsigned short>(mlist, static_cast<size_t>(*merged_port_count));
+  if (std::ranges::find(existing_ports, p) != existing_ports.end())
+    return;
   mlist[*merged_port_count] = p;
   (*merged_port_count)++;
 }
@@ -348,7 +352,7 @@ static unsigned short *merge_port_lists(unsigned short *port_list1, int count1,
                                         unsigned short *port_list2, int count2,
                                         int *merged_port_count) {
   int i;
-  unsigned short *merged_port_list = NULL;
+  unsigned short *merged_port_list = nullptr;
 
   *merged_port_count = 0;
 
@@ -432,7 +436,7 @@ void validate_scan_lists(scan_lists &vports, NmapOps &vo) {
       vports.syn_ping_count = merged_port_count;
       vports.syn_ping_ports = merged_port_list;
       vports.ack_ping_count = 0;
-      vports.ack_ping_ports = NULL;
+      vports.ack_ping_ports = nullptr;
     }
     vo.pingtype &= ~PINGTYPE_TCP_USE_ACK;
     vo.pingtype |= PINGTYPE_TCP_USE_SYN;
@@ -531,14 +535,14 @@ static bool load_nmaprc(int argc, char **argv, int *new_argc, char ***new_argv) 
   /* Determine config file path */
   const char *rcpath = getenv("NMAPRC");
   char pathbuf[4096];
-  if (rcpath == NULL || rcpath[0] == '\0') {
+  if (rcpath == nullptr || rcpath[0] == '\0') {
     const char *home = getenv("HOME");
 #ifdef WIN32
-    if (home == NULL || home[0] == '\0') {
+    if (home == nullptr || home[0] == '\0') {
       home = getenv("USERPROFILE");
     }
 #endif
-    if (home == NULL || home[0] == '\0')
+    if (home == nullptr || home[0] == '\0')
       return false;
     if (snprintf(pathbuf, sizeof(pathbuf), "%s/.nmaprc", home) >= (int)sizeof(pathbuf))
       return false;
@@ -547,7 +551,7 @@ static bool load_nmaprc(int argc, char **argv, int *new_argc, char ***new_argv) 
 
   /* Try to open the file */
   FILE *fp = fopen(rcpath, "r");
-  if (fp == NULL)
+  if (fp == nullptr)
     return false; /* Missing file is not an error */
 
   /* Read tokens from the file */
@@ -555,7 +559,7 @@ static bool load_nmaprc(int argc, char **argv, int *new_argc, char ***new_argv) 
   char line[4096];
   int lineno = 0;
 
-  while (fgets(line, sizeof(line), fp) != NULL) {
+  while (fgets(line, sizeof(line), fp) != nullptr) {
     lineno++;
     /* Strip trailing newline */
     size_t len = strlen(line);
@@ -614,13 +618,13 @@ static bool load_nmaprc(int argc, char **argv, int *new_argc, char ***new_argv) 
   int idx = 0;
   nargv[idx++] = argv[0]; /* program name */
 
-  for (size_t i = 0; i < config_tokens.size(); i++)
-    nargv[idx++] = config_tokens[i];
+  for (char *token : config_tokens)
+    nargv[idx++] = token;
 
   for (int i = 1; i < argc; i++)
     nargv[idx++] = argv[i];
 
-  nargv[idx] = NULL;
+  nargv[idx] = nullptr;
 
   *new_argc = total;
   *new_argv = nargv;
@@ -636,7 +640,7 @@ void parse_options(int argc, char **argv) {
   int arg;
   long l;
   double d;
-  char *endptr = NULL;
+  char *endptr = nullptr;
   char errstr[256];
   int option_index;
 #ifdef WORDS_BIGENDIAN
@@ -751,6 +755,9 @@ void parse_options(int argc, char **argv) {
     {"resume", required_argument, 0, 0},
     {"no-nmaprc", no_argument, 0, 0},
     {"multicast-discovery", no_argument, 0, 0},
+    {"pg-dsn", required_argument, 0, 0},
+    {"pg-skip-recent", required_argument, 0, 0},
+    {"pg-no-skip", no_argument, 0, 0},
     {0, 0, 0, 0}
   };
 
@@ -809,7 +816,7 @@ void parse_options(int argc, char **argv) {
           l = tval2msecs(optarg);
           if (l < 5)
             fatal("Bogus --max-rtt-timeout argument specified, must be at least 5ms");
-          if (l >= 50 * 1000 && tval_unit(optarg) == NULL)
+          if (l >= 50 * 1000 && tval_unit(optarg) == nullptr)
             fatal("Since April 2010, the default unit for --max-rtt-timeout is seconds, so your time of \"%s\" is %g seconds. Use \"%sms\" for %g milliseconds.", optarg, l / 1000.0, optarg, l / 1000.0);
           if (l < 20)
             error("WARNING: You specified a round-trip time timeout (%ld ms) that is EXTRAORDINARILY SMALL.  Accuracy may suffer.", l);
@@ -818,14 +825,14 @@ void parse_options(int argc, char **argv) {
           l = tval2msecs(optarg);
           if (l < 0)
             fatal("Bogus --min-rtt-timeout argument specified");
-          if (l >= 50 * 1000 && tval_unit(optarg) == NULL)
+          if (l >= 50 * 1000 && tval_unit(optarg) == nullptr)
             fatal("Since April 2010, the default unit for --min-rtt-timeout is seconds, so your time of \"%s\" is %g seconds. Use \"%sms\" for %g milliseconds.", optarg, l / 1000.0, optarg, l / 1000.0);
           delayed_options.pre_min_rtt_timeout = l;
         } else if (strcmp(long_options[option_index].name, "initial-rtt-timeout") == 0) {
           l = tval2msecs(optarg);
           if (l <= 0)
             fatal("Bogus --initial-rtt-timeout argument specified.  Must be positive");
-          if (l >= 50 * 1000 && tval_unit(optarg) == NULL)
+          if (l >= 50 * 1000 && tval_unit(optarg) == nullptr)
             fatal("Since April 2010, the default unit for --initial-rtt-timeout is seconds, so your time of \"%s\" is %g seconds. Use \"%sms\" for %g milliseconds.", optarg, l / 1000.0, optarg, l / 1000.0);
           delayed_options.pre_init_rtt_timeout = l;
         } else if (strcmp(long_options[option_index].name, "excludefile") == 0) {
@@ -866,7 +873,7 @@ void parse_options(int argc, char **argv) {
           if (l < 0)
             fatal("Bogus --host-timeout argument specified");
           // if (l == 0) this is the default "no timeout" value, overriding timing template
-          if (l >= 10000 * 1000 && tval_unit(optarg) == NULL)
+          if (l >= 10000 * 1000 && tval_unit(optarg) == nullptr)
             fatal("Since April 2010, the default unit for --host-timeout is seconds, so your time of \"%s\" is %.1f hours. If this is what you want, use \"%ss\".", optarg, l / 1000.0 / 60 / 60, optarg);
           delayed_options.pre_host_timeout = l;
         } else if (strcmp(long_options[option_index].name, "ttl") == 0) {
@@ -906,7 +913,7 @@ void parse_options(int argc, char **argv) {
           if (l < 0)
             fatal("Bogus --scan-delay argument specified.");
           // if (l == 0) this is the default "no delay" value, overriding timing template
-          if (l >= 100 * 1000 && tval_unit(optarg) == NULL)
+          if (l >= 100 * 1000 && tval_unit(optarg) == nullptr)
             fatal("Since April 2010, the default unit for --scan-delay is seconds, so your time of \"%s\" is %.1f minutes. Use \"%sms\" for %g milliseconds.", optarg, l / 1000.0 / 60, optarg, l / 1000.0);
           delayed_options.pre_scan_delay = l;
         } else if (strcmp(long_options[option_index].name, "defeat-rst-ratelimit") == 0) {
@@ -917,7 +924,7 @@ void parse_options(int argc, char **argv) {
           l = tval2msecs(optarg);
           if (l < 0)
             fatal("Bogus --max-scan-delay argument specified.");
-          if (l >= 100 * 1000 && tval_unit(optarg) == NULL)
+          if (l >= 100 * 1000 && tval_unit(optarg) == nullptr)
             fatal("Since April 2010, the default unit for --max-scan-delay is seconds, so your time of \"%s\" is %.1f minutes. If this is what you want, use \"%ss\".", optarg, l / 1000.0 / 60, optarg);
           delayed_options.pre_max_scan_delay = l;
         } else if (strcmp(long_options[option_index].name, "max-retries") == 0) {
@@ -932,7 +939,7 @@ void parse_options(int argc, char **argv) {
           if (nsock_set_default_engine(optarg) < 0)
             fatal("Unknown or non-available engine: %s", optarg);
         } else if ((strcmp(long_options[option_index].name, "proxies") == 0) || (strcmp(long_options[option_index].name, "proxy") == 0)) {
-          if (nsock_proxychain_new(optarg, &o.proxy_chain, NULL) < 0)
+          if (nsock_proxychain_new(optarg, &o.proxy_chain, nullptr) < 0)
             fatal("Invalid proxy chain specification");
         } else if (strcmp(long_options[option_index].name, "discovery-ignore-rst") == 0) {
             o.discovery_ignore_rst = true;
@@ -955,9 +962,9 @@ void parse_options(int argc, char **argv) {
           delayed_options.raw_scan_options = true;
           if (o.extra_payload)
             fatal("Can't use the --data option(s) multiple times, or together.");
-          u8 *tempbuff=NULL;
+          u8 *tempbuff=nullptr;
           size_t len=0;
-          if( (tempbuff=parse_hex_string(optarg, &len))==NULL)
+          if( (tempbuff=parse_hex_string(optarg, &len))==nullptr)
             fatal("Invalid hex string specified");
           else {
             o.extra_payload_length = len;
@@ -980,7 +987,7 @@ void parse_options(int argc, char **argv) {
           delayed_options.raw_scan_options = true;
           if (o.extra_payload)
             fatal("Can't use the --data option(s) multiple times, or together.");
-          o.extra_payload_length = (int)strtol(optarg, NULL, 10);
+          o.extra_payload_length = (int)strtol(optarg, nullptr, 10);
           if (o.extra_payload_length < 0 || o.extra_payload_length > MAX_PAYLOAD_ALLOWED)
             fatal("data-length must be between 0 and %d", MAX_PAYLOAD_ALLOWED);
           if (o.extra_payload_length > 1400) /* 1500 - IP with opts - TCP with opts. */
@@ -994,7 +1001,7 @@ void parse_options(int argc, char **argv) {
         } else if (strcmp(long_options[option_index].name, "stylesheet") == 0) {
           o.setXSLStyleSheet(optarg);
         } else if (strcmp(long_options[option_index].name, "no-stylesheet") == 0) {
-          o.setXSLStyleSheet(NULL);
+          o.setXSLStyleSheet(nullptr);
         } else if (strcmp(long_options[option_index].name, "system-dns") == 0) {
           o.mass_dns = false;
         } else if (strcmp(long_options[option_index].name, "dns-servers") == 0) {
@@ -1136,6 +1143,23 @@ void parse_options(int argc, char **argv) {
           fatal("Cannot use --resume with other options. Usage: nmap --resume <filename>");
         } else if (strcmp(long_options[option_index].name, "no-nmaprc") == 0) {
           /* Already handled before parse_options(); nothing to do here. */
+        } else if (strcmp(long_options[option_index].name, "pg-dsn") == 0) {
+          o.pg_dsn = strdup(optarg);
+        } else if (strcmp(long_options[option_index].name, "pg-skip-recent") == 0) {
+          /* Parse duration: plain number = seconds, or suffixed with s/m/h/d */
+          char *endptr;
+          long val = strtol(optarg, &endptr, 10);
+          if (val <= 0) fatal("--pg-skip-recent value must be positive");
+          switch (*endptr) {
+            case '\0': case 's': break;
+            case 'm': val *= 60; break;
+            case 'h': val *= 3600; break;
+            case 'd': val *= 86400; break;
+            default: fatal("--pg-skip-recent: unknown suffix '%c' (use s/m/h/d)", *endptr);
+          }
+          o.pg_skip_recent = val;
+        } else if (strcmp(long_options[option_index].name, "pg-no-skip") == 0) {
+          o.pg_skip_recent = 0;
         } else {
           fatal("Unknown long option (%s) given@#!$#$", long_options[option_index].name);
         }
@@ -1179,7 +1203,7 @@ void parse_options(int argc, char **argv) {
         const char *p;
         if (o.debugging < 10) o.debugging++;
         if (o.verbose < 10) o.verbose++;
-        for (p = optarg != NULL ? optarg : ""; *p == 'd'; p++) {
+        for (p = optarg != nullptr ? optarg : ""; *p == 'd'; p++) {
           if (o.debugging < 10) o.debugging++;
           if (o.verbose < 10) o.verbose++;
         }
@@ -1267,7 +1291,7 @@ void parse_options(int argc, char **argv) {
       else {
         char buf[4] = "P\0";
         buf[1] = *optarg;
-        if (*(optarg + 1) != '\0' && NULL == strchr("STAUYBO", *optarg)) {
+        if (*(optarg + 1) != '\0' && nullptr == strchr("STAUYBO", *optarg)) {
           fatal("Unknown -P option -P%s.", optarg);
         }
         switch (*optarg) {
@@ -1551,7 +1575,7 @@ void parse_options(int argc, char **argv) {
       } else {
         const char *p;
         if (o.verbose < 10) o.verbose++;
-        for (p = optarg != NULL ? optarg : ""; *p == 'v'; p++)
+        for (p = optarg != nullptr ? optarg : ""; *p == 'v'; p++)
           if (o.verbose < 10) o.verbose++;
         if (*p != '\0')
           fatal("Invalid argument to -v: \"%s\".", optarg);
@@ -1572,9 +1596,8 @@ void  apply_delayed_options() {
   o.setaf(delayed_options.af == AF_UNSPEC ? AF_INET : delayed_options.af);
 
   if (o.verbose > 0) {
-    for (std::vector<std::string>::iterator it = delayed_options.verbose_out.begin(); it != delayed_options.verbose_out.end(); ++it) {
-      error("%s", it->c_str());
-    }
+    for (const auto &msg : delayed_options.verbose_out)
+      error("%s", msg.c_str());
   }
   delayed_options.verbose_out.clear();
 
@@ -1784,7 +1807,7 @@ void  apply_delayed_options() {
           tmphex[0] = *p;
           tmphex[1] = *(p + 1);
           tmphex[2] = '\0';
-          mac_data[pos] = (u8) strtol(tmphex, NULL, 16);
+          mac_data[pos] = (u8) strtol(tmphex, nullptr, 16);
           pos++;
           p += 2;
         } else break;
@@ -1966,7 +1989,7 @@ void nmap_free_mem() {
   freeinterfaces();
   AllProbes::service_scan_free();
   traceroute_hop_cache_clear();
-  nsock_set_default_engine(NULL);
+  nsock_set_default_engine(nullptr);
 }
 
 /* ScanPipeline: overlaps port scanning and service detection.
@@ -2029,7 +2052,7 @@ int nmap_main(int argc, char *argv[]) {
   struct addrset *exclude_group;
 #ifndef NOLUA
   /* Pre-Scan and Post-Scan script results datastructure */
-  ScriptResults *script_scan_results = NULL;
+  ScriptResults *script_scan_results = nullptr;
 #endif
   unsigned int ideal_scan_group_sz = 0;
   Target *currenths;
@@ -2046,7 +2069,7 @@ int nmap_main(int argc, char *argv[]) {
   /* Check for WSL and warn that things may not go well. */
   struct utsname uts;
   if (!uname(&uts)) {
-    if (strstr(uts.release, "Microsoft") != NULL) {
+    if (strstr(uts.release, "Microsoft") != nullptr) {
       error("Warning: %s may not work correctly on Windows Subsystem for Linux.\n"
           "For best performance and accuracy, use the native Windows build from %s/download.html#windows.",
           NMAP_NAME, NMAP_URL);
@@ -2055,7 +2078,7 @@ int nmap_main(int argc, char *argv[]) {
 #endif
 
   tzset();
-  now = time(NULL);
+  now = time(nullptr);
   err = n_localtime(&now, &local_time);
   if (err) {
     fatal("n_localtime failed: %s", strerror(err));
@@ -2087,7 +2110,7 @@ int nmap_main(int argc, char *argv[]) {
   if (o.debugging)
     nbase_set_log(fatal, error);
   else
-    nbase_set_log(fatal, NULL);
+    nbase_set_log(fatal, nullptr);
 
 
   tty_init(); // Put the keyboard in raw mode
@@ -2100,14 +2123,14 @@ int nmap_main(int argc, char *argv[]) {
 
   apply_delayed_options();
 
-  for (unsigned int i = 0; i < route_dst_hosts.size(); i++) {
+  for (const std::string &dst_host : route_dst_hosts) {
     const char *dst;
     struct sockaddr_storage ss;
     struct route_nfo rnfo;
     size_t sslen;
     int rc;
 
-    dst = route_dst_hosts[i].c_str();
+    dst = dst_host.c_str();
     rc = resolve(dst, 0, &ss, &sslen, o.af());
     if (rc != 0)
       fatal("Can't resolve %s: %s.", dst, gai_strerror(rc));
@@ -2135,7 +2158,7 @@ int nmap_main(int argc, char *argv[]) {
 
   /* IPv6 all-nodes multicast discovery (standalone mode) */
   if (o.multicast_discovery) {
-    const char *dev = o.device[0] ? o.device : NULL;
+    const char *dev = o.device[0] ? o.device : nullptr;
     std::vector<struct sockaddr_storage> mcast_hosts = do_multicast_discovery(dev);
     if (mcast_hosts.empty()) {
       log_write(LOG_STDOUT, "No hosts discovered via multicast.\n");
@@ -2159,7 +2182,7 @@ int nmap_main(int argc, char *argv[]) {
   fflush(stdout);
   fflush(stderr);
 
-  timep = time(NULL);
+  timep = time(nullptr);
   err = n_ctime(mytime, sizeof(mytime), &timep);
   if (err) {
     fatal("n_ctime failed: %s", strerror(err));
@@ -2216,6 +2239,15 @@ int nmap_main(int argc, char *argv[]) {
   if (o.verbose)
     output_ports_to_machine_parseable_output(&ports);
 
+  /* Initialize PostgreSQL live output if DSN is available */
+  {
+    const char *pg_dsn = o.pg_dsn;
+    if (!pg_dsn)
+      pg_dsn = getenv("NMAP_PG_DSN");
+    if (pg_dsn)
+      pg_output_init(pg_dsn, join_quoted(argv, argc).c_str(), NMAP_VERSION);
+  }
+
 #if defined(HAVE_SIGNAL) && defined(SIGPIPE)
   signal(SIGPIPE, SIG_IGN); /* ignore SIGPIPE so our program doesn't crash because
                                of it, but we really shouldn't get an unexpected
@@ -2268,12 +2300,21 @@ int nmap_main(int argc, char *argv[]) {
   exclude_group = addrset_new();
 
   /* lets load our exclude list */
-  if (o.excludefd != NULL) {
+  if (o.excludefd != nullptr) {
     load_exclude_file(exclude_group, o.excludefd);
     fclose(o.excludefd);
   }
-  if (o.exclude_spec != NULL) {
+  if (o.exclude_spec != nullptr) {
     load_exclude_string(exclude_group, o.exclude_spec);
+  }
+
+  /* Exclude hosts recently scanned in PostgreSQL */
+  if (pg_output_enabled() && o.pg_skip_recent > 0) {
+    pg_output_skip_recent(exclude_group, o.af(),
+                          ports.tcp_ports, ports.tcp_count,
+                          ports.udp_ports, ports.udp_count,
+                          ports.sctp_ports, ports.sctp_count,
+                          o.pg_skip_recent);
   }
 
   if (o.debugging > 3)
@@ -2367,7 +2408,7 @@ int nmap_main(int argc, char *argv[]) {
       }
 
       if (o.RawScan()) {
-        if (currenths->SourceSockAddr(NULL, NULL) != 0) {
+        if (currenths->SourceSockAddr(nullptr, nullptr) != 0) {
           if (o.SourceSockAddr(&ss, &sslen) == 0) {
             currenths->setSourceSockAddr(&ss, sslen);
           } else {
@@ -2433,12 +2474,12 @@ int nmap_main(int argc, char *argv[]) {
          only attach the callback to the one whose completions feed the worker.
          SYN and connect scans are the primary TCP scan types; we attach the
          callback to whichever fires last. */
-      host_done_cb sv_cb      = use_pipeline ? ScanPipeline::on_host_done : NULL;
-      void        *sv_cb_data = use_pipeline ? &pipe                       : NULL;
+      host_done_cb sv_cb      = use_pipeline ? ScanPipeline::on_host_done : nullptr;
+      void        *sv_cb_data = use_pipeline ? &pipe                       : nullptr;
 
       // Ultra_scan sets o.scantype for us so we don't have to worry
       if (o.synscan)
-        ultra_scan(Targets, &ports, SYN_SCAN, NULL, sv_cb, sv_cb_data);
+        ultra_scan(Targets, &ports, SYN_SCAN, nullptr, sv_cb, sv_cb_data);
 
       if (o.ackscan)
         ultra_scan(Targets, &ports, ACK_SCAN);
@@ -2462,7 +2503,7 @@ int nmap_main(int argc, char *argv[]) {
         ultra_scan(Targets, &ports, UDP_SCAN);
 
       if (o.connectscan)
-        ultra_scan(Targets, &ports, CONNECT_SCAN, NULL, sv_cb, sv_cb_data);
+        ultra_scan(Targets, &ports, CONNECT_SCAN, nullptr, sv_cb, sv_cb_data);
 
       if (o.sctpinitscan)
         ultra_scan(Targets, &ports, SCTP_INIT_SCAN);
@@ -2526,7 +2567,7 @@ int nmap_main(int argc, char *argv[]) {
     for (targetno = 0; targetno < Targets.size(); targetno++) {
       currenths = Targets[targetno];
       /* Now I can do the output and such for each host */
-      if (currenths->timedOut(NULL)) {
+      if (currenths->timedOut(nullptr)) {
         /* --open means don't show hosts without open ports, even timed-out ones. */
         if (o.openOnly() && !currenths->ports.hasOpenPorts())
           continue;
@@ -2578,6 +2619,9 @@ int nmap_main(int argc, char *argv[]) {
     }
     log_flush_all();
 
+    if (pg_output_enabled())
+      pg_output_hosts(Targets);
+
     o.numhosts_scanned += Targets.size();
 
     /* Free all of the Targets */
@@ -2603,12 +2647,15 @@ int nmap_main(int argc, char *argv[]) {
 
   addrset_free(exclude_group);
 
-  if (o.inputfd != NULL)
+  if (o.inputfd != nullptr)
     fclose(o.inputfd);
 
   printdatafilepaths();
 
   printfinaloutput();
+
+  if (pg_output_enabled())
+    pg_output_finish();
 
   free_scan_lists(&ports);
 
@@ -2704,7 +2751,7 @@ int gather_logfile_resumption_state(char *fname, int *myargc, char ***myargv) {
      free(unescaped);
   }
 
-  if (strstr(nmap_arg_buffer, "--randomize-hosts") != NULL) {
+  if (strstr(nmap_arg_buffer, "--randomize-hosts") != nullptr) {
     error("WARNING: You are attempting to resume a scan which used --randomize-hosts.  Some hosts in the last randomized batch may be missed and others may be repeated once");
   }
 
@@ -2724,7 +2771,7 @@ int gather_logfile_resumption_state(char *fname, int *myargc, char ***myargv) {
 
   /* Now it is time to figure out the last IP that was scanned */
   q = p;
-  found = NULL;
+  found = nullptr;
   /* Lets see if its a grepable log first (-oG) */
   while ((q = strstr(q, "\nHost: ")))
     found = q = q + 7;
@@ -2740,7 +2787,7 @@ int gather_logfile_resumption_state(char *fname, int *myargc, char ***myargv) {
   } else {
     /* Let's see if it's an XML log (-oX) */
     q = p;
-    found = NULL;
+    found = nullptr;
     while ((q = strstr(q, "\n<address addr=\""))) {
       q += 16;
       found = strchr(q, '"');
@@ -2762,7 +2809,7 @@ int gather_logfile_resumption_state(char *fname, int *myargc, char ***myargv) {
     } else {
       /* OK, I guess (hope) it is a normal log then (-oN) */
       q = p;
-      found = NULL;
+      found = nullptr;
       while ((q = strstr(q, "\nNmap scan report for ")))
         found = q = q + 22;
 
@@ -2808,8 +2855,8 @@ static char *executable_dir(const char *argv0) {
   char *path, *dir;
 
   path = executable_path(argv0);
-  if (path == NULL)
-    return NULL;
+  if (path == nullptr)
+    return nullptr;
   dir = path_get_dirname(path);
   free(path);
 
@@ -2852,12 +2899,11 @@ static int nmap_fetchfile_sub(char *filename_returned, int bufferlen, const char
       - NMAPDATADIR (usually $prefix/share/nmap)
     */
 int nmap_fetchfile(char *filename_returned, int bufferlen, const char *file) {
-  std::map<std::string, std::string>::iterator iter;
   int res;
 
   /* Check the map of requested data file names. */
-  iter = o.requested_data_files.find(file);
-  if (iter != o.requested_data_files.end()) {
+  if (auto iter = o.requested_data_files.find(file);
+      iter != o.requested_data_files.end()) {
     Strncpy(filename_returned, iter->second.c_str(), bufferlen);
     /* If a special file name was requested, we must not return any other file
        name. Return a positive result even if the file doesn't exist or is not
@@ -2877,7 +2923,7 @@ static int nmap_fetchfile_userdir(char *buf, size_t buflen, const char *file) {
   char appdata[MAX_PATH];
   int res;
 
-  if (SHGetFolderPath(NULL, CSIDL_APPDATA, NULL, SHGFP_TYPE_CURRENT, appdata) != S_OK)
+  if (SHGetFolderPath(nullptr, CSIDL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, appdata) != S_OK)
     return 0;
   res = Snprintf(buf, buflen, "%s\\nmap\\%s", appdata, file);
   if (res <= 0 || res >= buflen)
@@ -2891,7 +2937,7 @@ static int nmap_fetchfile_userdir_uid(char *buf, size_t buflen, const char *file
   int res;
 
   pw = getpwuid(uid);
-  if (pw == NULL)
+  if (pw == nullptr)
     return 0;
   res = Snprintf(buf, buflen, "%s/.nmap/%s", pw->pw_dir, file);
   if (res <= 0 || (size_t) res >= buflen)
@@ -2945,10 +2991,10 @@ static int nmap_fetchfile_sub(char *filename_returned, int bufferlen, const char
   char *dir;
 
   argv0 = get_program_name();
-  assert(argv0 != NULL);
+  assert(argv0 != nullptr);
   dir = executable_dir(argv0);
 
-  if (dir != NULL) {
+  if (dir != nullptr) {
     if (!foundsomething) { /* Try the nMap directory */
       res = Snprintf(filename_returned, bufferlen, "%s/%s", dir, file);
       if (res > 0 && res < bufferlen) {
@@ -3086,7 +3132,7 @@ static void display_nmap_version() {
   if (o.have_pcap) {
     const char *pcap_version = pcap_lib_version();
     const char *pcap_num = strpbrk(pcap_version, "0123456789");
-    if (pcap_num == NULL)
+    if (pcap_num == nullptr)
       pcap_num = "(unknown)";
     std::string pcap_num_str (pcap_num, strcspn(pcap_num, ","));
     with.push_back(get_word_or_quote(pcap_version, 0) + std::string("-") + pcap_num_str);

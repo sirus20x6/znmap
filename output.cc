@@ -86,10 +86,15 @@
 
 #include <math.h>
 
+#include <array>
+#include <format>
+#include <memory>
+#include <print>
 #include <set>
 #include <vector>
 #include <list>
 #include <sstream>
+#include <utility>
 
 extern NmapOps o;
 static const char *logtypes[LOG_NUM_FILES] = LOG_NAMES;
@@ -295,7 +300,7 @@ int print_iflist(void) {
   int numifs = 0, numroutes = 0;
   struct interface_info *iflist;
   struct sys_route *routes;
-  NmapOutputTable *Tbl = NULL;
+  std::unique_ptr<NmapOutputTable> Tbl;
   char errstr[256];
   const char *address = NULL;
   errstr[0]='\0';
@@ -310,7 +315,7 @@ int print_iflist(void) {
       log_write(LOG_STDOUT, "Reason: %s\n", errstr);
   } else {
     int devcol = 0, shortdevcol = 1, ipcol = 2, typecol = 3, upcol = 4, mtucol = 5, maccol = 6;
-    Tbl = new NmapOutputTable(numifs + 1, 7);
+    Tbl = std::make_unique<NmapOutputTable>(numifs + 1, 7);
     Tbl->addItem(0, devcol, false, "DEV", 3);
     Tbl->addItem(0, shortdevcol, false, "(SHORT)", 7);
     Tbl->addItem(0, ipcol, false, "IP/MASK", 7);
@@ -346,7 +351,7 @@ int print_iflist(void) {
     log_write(LOG_PLAIN, "************************INTERFACES************************\n");
     log_write(LOG_PLAIN, "%s\n", Tbl->printableTable(NULL));
     log_flush_all();
-    delete Tbl;
+    Tbl.reset();
   }
 
 #ifdef WIN32
@@ -364,7 +369,7 @@ int print_iflist(void) {
       log_write(LOG_STDOUT, "Reason: %s\n", errstr);
   } else {
     int dstcol = 0, devcol = 1, metcol = 2, gwcol = 3;
-    Tbl = new NmapOutputTable(numroutes + 1, 4);
+    Tbl = std::make_unique<NmapOutputTable>(numroutes + 1, 4);
     Tbl->addItem(0, dstcol, false, "DST/MASK", 8);
     Tbl->addItem(0, devcol, false, "DEV", 3);
     Tbl->addItem(0, metcol, false, "METRIC", 6);
@@ -381,7 +386,7 @@ int print_iflist(void) {
     log_write(LOG_PLAIN, "**************************ROUTES**************************\n");
     log_write(LOG_PLAIN, "%s\n", Tbl->printableTable(NULL));
     log_flush_all();
-    delete Tbl;
+    Tbl.reset();
   }
   return 0;
 }
@@ -391,15 +396,12 @@ int print_iflist(void) {
 static std::string escape_for_screen(const std::string s) {
   std::string r;
 
-  for (unsigned int i = 0; i < s.size(); i++) {
-    char buf[5];
-    unsigned char c = s[i];
+  for (unsigned char c : s) {
     // Printable and some whitespace ok. "\r" not ok because it overwrites the line.
     if (c == '\t' || c == '\n' || (0x20 <= c && c <= 0x7e)) {
       r += c;
     } else {
-      Snprintf(buf, sizeof(buf), "\\x%02X", c);
-      r += buf;
+      r += std::format("\\x{:02X}", c);
     }
   }
 
@@ -414,15 +416,12 @@ static std::string escape_for_screen(const std::string s) {
 std::string protect_xml(const std::string s) {
   std::string r;
 
-  for (unsigned int i = 0; i < s.size(); i++) {
-    char buf[5];
-    unsigned char c = s[i];
+  for (unsigned char c : s) {
     // Printable and some whitespace ok.
     if (c == '\t' || c == '\r' || c == '\n' || (0x20 <= c && c <= 0x7e)) {
       r += c;
     } else {
-      Snprintf(buf, sizeof(buf), "\\x%02X", c);
-      r += buf;
+      r += std::format("\\x{:02X}", c);
     }
   }
 
@@ -492,7 +491,7 @@ void printportoutput(const Target *currenths, const PortList *plist) {
   Port port;
   char hostname[1200];
   struct serviceDeductions sd;
-  NmapOutputTable *Tbl = NULL;
+  std::unique_ptr<NmapOutputTable> Tbl;
   int portcol = -1;             // port or IP protocol #
   int statecol = -1;            // port/protocol state
   int servicecol = -1;          // service or protocol name
@@ -638,7 +637,7 @@ void printportoutput(const Target *currenths, const PortList *plist) {
   assert(numrows > 0);
   numrows++; // The header counts as a row
 
-  Tbl = new NmapOutputTable(numrows, colno);
+  Tbl = std::make_unique<NmapOutputTable>(numrows, colno);
 
   // Lets start with the headers
   if (o.ipprotscan)
@@ -672,7 +671,7 @@ void printportoutput(const Target *currenths, const PortList *plist) {
         }
         state = statenum2str(current->state);
         proto = nmap_getprotbynum(current->portno);
-        Snprintf(portinfo, sizeof(portinfo), "%s", proto ? proto->p_name : "unknown");
+        Strncpy(portinfo, std::format("{}", proto ? proto->p_name : "unknown").c_str(), sizeof(portinfo));
         Tbl->addItemFormatted(rowno, portcol, false, "%d", current->portno);
         Tbl->addItem(rowno, statecol, true, state);
         Tbl->addItem(rowno, servicecol, true, portinfo);
@@ -717,7 +716,7 @@ void printportoutput(const Target *currenths, const PortList *plist) {
         else
           first = 0;
         strcpy(protocol, IPPROTO2STR(current->proto));
-        Snprintf(portinfo, sizeof(portinfo), "%d/%s", current->portno, protocol);
+        Strncpy(portinfo, std::format("{}/{}", current->portno, protocol).c_str(), sizeof(portinfo));
         state = statenum2str(current->state);
         plist->getServiceDeductions(current->portno, current->proto, &sd);
         if (sd.service_fp && saved_servicefps.size() <= 8)
@@ -825,7 +824,7 @@ void printportoutput(const Target *currenths, const PortList *plist) {
 
   // Now we write the table for the user
   log_write(LOG_PLAIN, "%s", Tbl->printableTable(NULL));
-  delete Tbl;
+  Tbl.reset();
 
   // There may be service fingerprints I would like the user to submit
   if (saved_servicefps.size() > 0) {
@@ -1126,26 +1125,23 @@ void output_ports_to_machine_parseable_output(const struct scan_lists *ports) {
 
 // A simple helper function for doscaninfo handles the c14n of o.scanflags
 static void doscanflags() {
-  struct {
-    unsigned char flag;
-    const char *name;
-  } flags[] = {
-    { TH_FIN, "FIN" },
-    { TH_SYN, "SYN" },
-    { TH_RST, "RST" },
-    { TH_PUSH, "PSH" },
-    { TH_ACK, "ACK" },
-    { TH_URG, "URG" },
-    { TH_ECE, "ECE" },
-    { TH_CWR, "CWR" }
+  constexpr std::array flags{
+    std::pair{TH_FIN, "FIN"},
+    std::pair{TH_SYN, "SYN"},
+    std::pair{TH_RST, "RST"},
+    std::pair{TH_PUSH, "PSH"},
+    std::pair{TH_ACK, "ACK"},
+    std::pair{TH_URG, "URG"},
+    std::pair{TH_ECE, "ECE"},
+    std::pair{TH_CWR, "CWR"},
   };
 
   if (o.scanflags != -1) {
     std::string flagstring;
 
-    for (unsigned int i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
-      if (o.scanflags & flags[i].flag)
-        flagstring += flags[i].name;
+    for (const auto &[flag, name] : flags) {
+      if (o.scanflags & flag)
+        flagstring += name;
     }
     xml_attribute("scanflags", "%s", flagstring.c_str());
   }
@@ -1242,13 +1238,13 @@ static void print_MAC_XML_Info(const Target *currenths) {
   char macascii[32];
 
   if (mac) {
-    const char *macvendor = MACPrefix2Corp(mac);
-    Snprintf(macascii, sizeof(macascii), "%02X:%02X:%02X:%02X:%02X:%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    const auto formatted_mac = std::format("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                                           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    Strncpy(macascii, formatted_mac.c_str(), sizeof(macascii));
     xml_open_start_tag("address");
     xml_attribute("addr", "%s", macascii);
     xml_attribute("addrtype", "mac");
-    if (macvendor)
+    if (const char *macvendor = MACPrefix2Corp(mac); macvendor)
       xml_attribute("vendor", "%s", macvendor);
     xml_close_empty_tag();
     xml_newline();
@@ -1364,7 +1360,6 @@ static void write_xml_osmatch(const FingerMatch *match, double accuracy) {
 static char *num_to_string_sigdigits(double d, int digits) {
   static char buf[32];
   int shift;
-  int n;
 
   assert(digits >= 0);
   if (d == 0.0) {
@@ -1375,7 +1370,9 @@ static char *num_to_string_sigdigits(double d, int digits) {
     d = d * pow(10.0, shift);
   }
 
-  n = Snprintf(buf, sizeof(buf), "%.*f", MAX(0, -shift), d);
+  const auto formatted = std::format("{:.{}f}", d, MAX(0, -shift));
+  const int n = static_cast<int>(formatted.size());
+  Strncpy(buf, formatted.c_str(), sizeof(buf));
   assert(n > 0 && n < (int) sizeof(buf));
 
   return buf;
@@ -1547,7 +1544,9 @@ static void printosclassificationoutput(const struct
       if (strcmp(OSR->OSC[classno]->OS_Vendor, OSR->OSC[classno]->OS_Family) == 0)
         Strncpy(tmpbuf, OSR->OSC[classno]->OS_Family, sizeof(tmpbuf));
       else
-        Snprintf(tmpbuf, sizeof(tmpbuf), "%s %s", OSR->OSC[classno]->OS_Vendor, OSR->OSC[classno]->OS_Family);
+        Strncpy(tmpbuf,
+                std::format("{} {}", OSR->OSC[classno]->OS_Vendor, OSR->OSC[classno]->OS_Family).c_str(),
+                sizeof(tmpbuf));
 
 
       // Let's see if it is already in the array
@@ -1627,9 +1626,10 @@ void printmacinfo(const Target *currenths) {
   char macascii[32];
 
   if (mac) {
+    const auto formatted_mac = std::format("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                                           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    Strncpy(macascii, formatted_mac.c_str(), sizeof(macascii));
     const char *macvendor = MACPrefix2Corp(mac);
-    Snprintf(macascii, sizeof(macascii), "%02X:%02X:%02X:%02X:%02X:%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     log_write(LOG_PLAIN, "MAC Address: %s (%s)\n", macascii,
               macvendor ? macvendor : "Unknown");
   }
@@ -2002,9 +2002,9 @@ void printosscanoutput(const Target *currenths) {
         fatal("STRANGE ERROR #3877 -- please report to fyodor@nmap.org\n");
       if (p != numlst)
         *p++ = ',';
-      sprintf(p, "%X", currenths->seq.seqs[i]);
-      while (*p)
-        p++;
+      const auto seq = std::format("{:X}", currenths->seq.seqs[i]);
+      memcpy(p, seq.c_str(), seq.size() + 1);
+      p += seq.size();
     }
 
     xml_open_start_tag("tcpsequence");
@@ -2026,9 +2026,9 @@ void printosscanoutput(const Target *currenths) {
         fatal("STRANGE ERROR #3876 -- please report to fyodor@nmap.org\n");
       if (p != numlst)
         *p++ = ',';
-      sprintf(p, "%hX", currenths->seq.ipids[i]);
-      while (*p)
-        p++;
+      const auto seq = std::format("{:X}", currenths->seq.ipids[i]);
+      memcpy(p, seq.c_str(), seq.size() + 1);
+      p += seq.size();
     }
     xml_open_start_tag("ipidsequence");
     xml_attribute("class", "%s", ipidclass2ascii(currenths->seq.ipid_seqclass));
@@ -2047,9 +2047,9 @@ void printosscanoutput(const Target *currenths) {
         fatal("STRANGE ERROR #3878 -- please report to fyodor@nmap.org\n");
       if (p != numlst)
         *p++ = ',';
-      sprintf(p, "%X", currenths->seq.timestamps[i]);
-      while (*p)
-        p++;
+      const auto seq = std::format("{:X}", currenths->seq.timestamps[i]);
+      memcpy(p, seq.c_str(), seq.size() + 1);
+      p += seq.size();
     }
 
     xml_open_start_tag("tcptssequence");
@@ -2251,7 +2251,9 @@ void printhostscriptresults(const Target *currenths) {
 
 /* Print a table with traceroute hops. */
 static void printtraceroute_normal(const Target *currenths) {
-  static const int HOP_COL = 0, RTT_COL = 1, HOST_COL = 2;
+  static constexpr int HOP_COL = 0;
+  static constexpr int RTT_COL = 1;
+  static constexpr int HOST_COL = 2;
   NmapOutputTable Tbl(currenths->traceroute_hops.size() + 1, 3);
   struct probespec probe;
   std::list<TracerouteHop>::const_iterator it;

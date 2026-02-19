@@ -59,6 +59,13 @@
 
 #include "nsock_internal.h"
 
+#ifdef HAVE_IO_URING
+  extern struct io_engine engine_io_uring;
+  #define ENGINE_IO_URING &engine_io_uring,
+#else
+  #define ENGINE_IO_URING
+#endif /* HAVE_IO_URING */
+
 #if HAVE_IOCP
   extern struct io_engine engine_iocp;
   #define ENGINE_IOCP &engine_iocp,
@@ -94,6 +101,7 @@ extern struct io_engine engine_select;
 /* Available IO engines. This depends on which IO management interfaces are
  * available on your system. Engines must be sorted by order of preference */
 static struct io_engine *available_engines[] = {
+  ENGINE_IO_URING
   ENGINE_EPOLL
   ENGINE_KQUEUE
   ENGINE_POLL
@@ -170,6 +178,9 @@ int nsock_set_default_engine(char *engine) {
 
 const char *nsock_list_engines(void) {
   return
+#ifdef HAVE_IO_URING
+  "io_uring "
+#endif
 #if HAVE_IOCP
   "iocp "
 #endif
@@ -184,4 +195,3 @@ const char *nsock_list_engines(void) {
 #endif
   "select";
 }
-

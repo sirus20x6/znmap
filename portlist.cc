@@ -75,18 +75,18 @@
 #include <strings.h>
 #endif /* HAVE_STRINGS_H */
 
+#include <memory>
+
 extern NmapOps o;  /* option structure */
 
 Port::Port() {
   portno = proto = 0;
   state = 0;
-  service = NULL;
+  service = nullptr;
   state_reason_init(&reason);
 }
 
 void serviceDeductions::erase() {
-  std::vector<char *>::iterator it;
-
   if (this->product)
     free(this->product);
   if (this->version)
@@ -102,20 +102,20 @@ void serviceDeductions::erase() {
   if (this->service_fp)
     free(this->service_fp);
   // For now, always free CPE strings
-  for (it = this->cpe.begin(); it != this->cpe.end(); it++)
-    free(*it);
+  for (char *entry : this->cpe)
+    free(entry);
   this->cpe.clear();
 
-  this->name = NULL;
+  this->name = nullptr;
   this->name_confidence = 0;
-  this->product = NULL;
-  this->version = NULL;
-  this->extrainfo = NULL;
-  this->hostname = NULL;
-  this->ostype = NULL;
-  this->devicetype = NULL;
+  this->product = nullptr;
+  this->version = nullptr;
+  this->extrainfo = nullptr;
+  this->hostname = nullptr;
+  this->ostype = nullptr;
+  this->devicetype = nullptr;
   this->service_tunnel = SERVICE_TUNNEL_NONE;
-  this->service_fp = NULL;
+  this->service_fp = nullptr;
   this->dtype = SERVICE_DETECTION_TABLE;
 }
 
@@ -139,26 +139,26 @@ void Port::getNmapServiceName(char *namebuf, int buflen) const {
   const char *service_name;
   int len;
 
-  if (service != NULL && service->service_tunnel == SERVICE_TUNNEL_SSL)
+  if (service != nullptr && service->service_tunnel == SERVICE_TUNNEL_SSL)
     tunnel_prefix = "ssl/";
   else
     tunnel_prefix = "";
 
-  if (service != NULL && service->name != NULL) {
+  if (service != nullptr && service->name != nullptr) {
     service_name = service->name;
   } else {
     const struct nservent *service;
 
     service = nmap_getservbyport(portno, proto);
-    if (service != NULL)
+    if (service != nullptr)
       service_name = service->s_name;
     else
-      service_name = NULL;
+      service_name = nullptr;
   }
 
-  if (service_name != NULL && strcmp(service_name, "unknown") != 0) {
+  if (service_name != nullptr && strcmp(service_name, "unknown") != 0) {
     /* The port has a name and the name is not "unknown". How confident are we? */
-    if (o.servicescan && state == PORT_OPEN && (service == NULL || service->name_confidence <= 5))
+    if (o.servicescan && state == PORT_OPEN && (service == nullptr || service->name_confidence <= 5))
       len = Snprintf(namebuf, buflen, "%s%s?", tunnel_prefix, service_name);
     else
       len = Snprintf(namebuf, buflen, "%s%s", tunnel_prefix, service_name);
@@ -173,16 +173,16 @@ void Port::getNmapServiceName(char *namebuf, int buflen) const {
 }
 
 serviceDeductions::serviceDeductions() {
-  name = NULL;
+  name = nullptr;
   name_confidence = 0;
-  product = NULL;
-  version = NULL;
-  extrainfo = NULL;
-  hostname = NULL;
-  ostype = NULL;
-  devicetype = NULL;
+  product = nullptr;
+  version = nullptr;
+  extrainfo = nullptr;
+  hostname = nullptr;
+  ostype = nullptr;
+  devicetype = nullptr;
   service_tunnel = SERVICE_TUNNEL_NONE;
-  service_fp = NULL;
+  service_fp = nullptr;
   dtype = SERVICE_DETECTION_TABLE;
 }
 
@@ -263,16 +263,16 @@ void PortList::getServiceDeductions(u16 portno, int protocol, struct serviceDedu
   const Port *port;
 
   port = lookupPort(portno, protocol);
-  if (port == NULL || port->service == NULL) {
+  if (port == nullptr || port->service == nullptr) {
     const struct nservent *service;
 
     /* Look up the service name. */
     *sd = serviceDeductions();
     service = nmap_getservbyport(portno, protocol);
-    if (service != NULL)
+    if (service != nullptr)
       sd->name = service->s_name;
     else
-      sd->name = NULL;
+      sd->name = nullptr;
     sd->name_confidence = 3;
   } else {
     *sd = *port->service;
@@ -280,14 +280,14 @@ void PortList::getServiceDeductions(u16 portno, int protocol, struct serviceDedu
 }
 
 
-// sname should be NULL if sres is not
+// sname should be nullptr if sres is not
 // PROBESTATE_FINISHED_MATCHED. product,version, and/or extrainfo
-// will be NULL if unavailable. Note that this function makes its
+// will be nullptr if unavailable. Note that this function makes its
 // own copy of sname and product/version/extrainfo.  This function
 // also takes care of truncating the version strings to a
 // 'reasonable' length if necessary, and cleaning up any unprintable
 // chars. (these tests are to avoid annoying DOS (or other) attacks
-// by malicious services).  The fingerprint should be NULL unless
+// by malicious services).  The fingerprint should be nullptr unless
 // one is available and the user should submit it.  tunnel must be
 // SERVICE_TUNNEL_NULL (normal) or SERVICE_TUNNEL_SSL (means ssl was
 // detected and we tried to tunnel through it ).
@@ -296,7 +296,7 @@ static char *cstringSanityCheck(const char* string, int len) {
   int slen;
 
   if(!string)
-          return NULL;
+          return nullptr;
 
   slen = strlen(string);
   if (slen > len) slen = len;
@@ -313,13 +313,12 @@ void PortList::setServiceProbeResults(u16 portno, int protocol,
   const char *extrainfo, const char *hostname, const char *ostype,
   const char *devicetype, const std::vector<const char *> *cpe,
   const char *fingerprint) {
-  std::vector<char *>::iterator it;
   Port *port;
   char *p;
 
   port = createPort(portno, protocol);
-  if (port->service == NULL)
-    port->service = new serviceDeductions;
+  if (port->service == nullptr)
+    port->service = std::make_unique<serviceDeductions>().release();
   else
     port->service->erase();
 
@@ -329,16 +328,16 @@ void PortList::setServiceProbeResults(u16 portno, int protocol,
     port->service->name_confidence = 10;
   } else if (sres == PROBESTATE_FINISHED_TCPWRAPPED) {
     port->service->dtype = SERVICE_DETECTION_PROBED;
-    if (sname == NULL)
+    if (sname == nullptr)
       sname = "tcpwrapped";
     port->service->name_confidence = 8;
   } else {
     /* PROBESTATE_FINISHED_NOMATCH, PROBESTATE_EXCLUDED, PROBESTATE_INCOMPLETE.
        Just look up the service name if none is provided. */
-    if (sname == NULL) {
+    if (sname == nullptr) {
       const struct nservent *service;
       service = nmap_getservbyport(portno, protocol);
-      if (service != NULL)
+      if (service != nullptr)
         sname = service->s_name;
     }
     port->service->dtype = SERVICE_DETECTION_TABLE;
@@ -351,12 +350,12 @@ void PortList::setServiceProbeResults(u16 portno, int protocol,
   if (sname)
     port->service->name = string_pool_insert(sname);
   else
-    port->service->name = NULL;
+    port->service->name = nullptr;
 
   if (fingerprint)
     port->service->service_fp = strdup(fingerprint);
   else
-    port->service->service_fp = NULL;
+    port->service->service_fp = nullptr;
 
   port->service->product = cstringSanityCheck(product, 80);
   port->service->version = cstringSanityCheck(version, 80);
@@ -370,7 +369,7 @@ void PortList::setServiceProbeResults(u16 portno, int protocol,
 
     for (cit = cpe->begin(); cit != cpe->end(); cit++) {
       p = cstringSanityCheck(*cit, 80);
-      if (p != NULL)
+      if (p != nullptr)
         port->service->cpe.push_back(p);
     }
   }
@@ -446,7 +445,7 @@ PortList::PortList() {
   }
 
   numscriptresults = 0;
-  idstr = NULL;
+  idstr = nullptr;
 }
 
 PortList::~PortList() {
@@ -454,7 +453,7 @@ PortList::~PortList() {
 
   if (idstr) {
     free(idstr);
-    idstr = NULL;
+    idstr = nullptr;
   }
 
   for(proto=0; proto < PORTLIST_PROTO_MAX; proto++) { // for every protocol
@@ -482,7 +481,7 @@ void PortList::setDefaultPortState(u8 protocol, int state) {
   int i;
 
   for (i = 0; i < port_list_count[proto]; i++) {
-    if (port_list[proto][i] == NULL) {
+    if (port_list[proto][i] == nullptr) {
       state_counts_proto[proto][default_port_state[proto].state]--;
       state_counts_proto[proto][state]++;
     }
@@ -534,7 +533,7 @@ void PortList::setPortState(u16 portno, u8 protocol, int state, int *oldstate) {
   state_counts_proto[proto][state]++;
 
   if(state == PORT_FILTERED || state == PORT_OPENFILTERED)
-    setStateReason(current, ER_NORESPONSE, 0, NULL);
+    setStateReason(current, ER_NORESPONSE, 0, nullptr);
   return;
 }
 
@@ -549,7 +548,7 @@ int PortList::getPortState(u16 portno, u8 protocol) {
   /* Cache miss (0 = unset): fall back to Port struct or default */
   const Port *port;
   port = lookupPort(portno, protocol);
-  if (port == NULL)
+  if (port == nullptr)
     return default_port_state[pidx].state;
   return port->state;
 }
@@ -558,7 +557,7 @@ int PortList::getPortState(u16 portno, u8 protocol) {
    default state as defined by setDefaultPortState and every other data field is
    unset. */
 bool PortList::portIsDefault(u16 portno, u8 protocol) {
-  return lookupPort(portno, protocol) == NULL;
+  return lookupPort(portno, protocol) == nullptr;
 }
 
   /* Saves an identification string for the target containing these
@@ -568,7 +567,7 @@ bool PortList::portIsDefault(u16 portno, u8 protocol) {
 void PortList::setIdStr(const char *id) {
   int len = 0;
   if (idstr) free(idstr);
-  if (!id) { idstr = NULL; return; }
+  if (!id) { idstr = nullptr; return; }
   len = strlen(id);
   len += 5; // " on " + \0
   idstr = (char *) safe_malloc(len);
@@ -587,9 +586,9 @@ int PortList::getStateCounts(int state) const {
   return(sum);
 }
 
-  /* A function for iterating through the ports.  Give NULL for the
+  /* A function for iterating through the ports.  Give nullptr for the
    first "afterthisport".  Then supply the most recent returned port
-   for each subsequent call.  When no more matching ports remain, NULL
+   for each subsequent call.  When no more matching ports remain, nullptr
    will be returned.  To restrict returned ports to just one protocol,
    specify IPPROTO_TCP, IPPROTO_UDP or IPPROTO_SCTP for
    allowed_protocol. A TCPANDUDPANDSCTP for allowed_protocol matches
@@ -605,7 +604,7 @@ Port *PortList::nextPort(const Port *cur, Port *next,
 
   if (cur) {
     proto = INPROTO2PORTLISTPROTO(cur->proto);
-    assert(port_map[proto]!=NULL); // Hmm, it's not possible to handle port that doesn't have anything in map
+    assert(port_map[proto]!=nullptr); // Hmm, it's not possible to handle port that doesn't have anything in map
     assert(cur->proto!=IPPROTO_IP || cur->portno<=MAX_IPPROTONUM);
     mapped_pno = port_map[proto][cur->portno];
     mapped_pno++; //  we're interested in next port after current
@@ -619,7 +618,7 @@ Port *PortList::nextPort(const Port *cur, Port *next,
     mapped_pno = 0;
   }
 
-  if(port_list[proto] != NULL) {
+  if(port_list[proto] != nullptr) {
     for(;mapped_pno < port_list_count[proto]; mapped_pno++) {
       port = port_list[proto][mapped_pno];
       if (port && (allowed_state==0 || port->state==allowed_state)) {
@@ -637,14 +636,14 @@ Port *PortList::nextPort(const Port *cur, Port *next,
   /* if all protocols, than after TCP search UDP & SCTP */
   if((!cur && allowed_protocol == TCPANDUDPANDSCTP) ||
       (cur && proto == INPROTO2PORTLISTPROTO(IPPROTO_TCP)))
-    return(nextPort(NULL, next, UDPANDSCTP, allowed_state));
+    return(nextPort(nullptr, next, UDPANDSCTP, allowed_state));
 
   /* if all protocols, than after UDP search SCTP */
   if((!cur && allowed_protocol == UDPANDSCTP) ||
       (cur && proto == INPROTO2PORTLISTPROTO(IPPROTO_UDP)))
-    return(nextPort(NULL, next, IPPROTO_SCTP, allowed_state));
+    return(nextPort(nullptr, next, IPPROTO_SCTP, allowed_state));
 
-  return(NULL);
+  return(nullptr);
 }
 
 /* Convert portno and protocol into the internal indices used to index
@@ -656,7 +655,7 @@ void PortList::mapPort(u16 *portno, u8 *protocol) const {
 
   if (*protocol == IPPROTO_IP)
     assert(*portno <= MAX_IPPROTONUM);
-  if(port_map[mapped_protocol]==NULL || port_list[mapped_protocol]==NULL) {
+  if(port_map[mapped_protocol]==nullptr || port_list[mapped_protocol]==nullptr) {
     fatal("%s(%i,%i): you're trying to access uninitialized protocol", __func__, *portno, *protocol);
   }
   mapped_portno = port_map[mapped_protocol][*portno];
@@ -684,8 +683,9 @@ Port *PortList::createPort(u16 portno, u8 protocol, bool *created) {
   mapPort(&mapped_portno, &mapped_protocol);
 
   p = port_list[mapped_protocol][mapped_portno];
-  if (p == NULL) {
-    p = new Port();
+  if (p == nullptr) {
+    auto new_port = std::make_unique<Port>();
+    p = new_port.release();
     p->portno = portno;
     p->proto = protocol;
     p->state = default_port_state[mapped_protocol].state;
@@ -699,7 +699,7 @@ Port *PortList::createPort(u16 portno, u8 protocol, bool *created) {
 }
 
 int PortList::forgetPort(u16 portno, u8 protocol) {
-  Port *answer = NULL;
+  Port *answer = nullptr;
   int proto_idx = INPROTO2PORTLISTPROTO(protocol);
   u16 orig_portno = portno;
 
@@ -708,7 +708,7 @@ int PortList::forgetPort(u16 portno, u8 protocol) {
   mapPort(&portno, &protocol);
 
   answer = port_list[protocol][portno];
-  if (answer == NULL)
+  if (answer == nullptr)
     return -1;
 
   state_counts_proto[protocol][answer->state]--;
@@ -717,7 +717,7 @@ int PortList::forgetPort(u16 portno, u8 protocol) {
   /* Clear cache entry so getPortState falls back to default */
   portstate_set(portstate_cache[proto_idx], orig_portno, 0);
 
-  port_list[protocol][portno] = NULL;
+  port_list[protocol][portno] = nullptr;
 
   if (o.verbose) {
     log_write(LOG_STDOUT, "Deleting port %hu/%s, which we thought was %s\n",
@@ -738,11 +738,11 @@ void PortList::freePortMap() {
   for (proto=0; proto < PORTLIST_PROTO_MAX; proto++) {
     if (port_map[proto]) {
       free(port_map[proto]);
-      port_map[proto] = NULL;
+      port_map[proto] = nullptr;
     }
     if (port_map_rev[proto]) {
       free(port_map_rev[proto]);
-      port_map_rev[proto] = NULL;
+      port_map_rev[proto] = nullptr;
     }
     port_list_count[proto] = 0;
   }
@@ -761,7 +761,7 @@ void PortList::initializePortMap(int protocol, u16 *ports, int portcount) {
   int ports_max = (protocol == IPPROTO_IP) ? MAX_IPPROTONUM + 1 : 65536;
   int proto = INPROTO2PORTLISTPROTO(protocol);
 
-  if (port_map[proto] != NULL || port_map_rev[proto] != NULL)
+  if (port_map[proto] != nullptr || port_map_rev[proto] != nullptr)
     fatal("%s: portmap for protocol %i already initialized", __func__, protocol);
 
   assert(port_list_count[proto]==0);
@@ -844,7 +844,7 @@ bool PortList::isIgnoredState(int state, int *count) const {
     return false;
 
   tmp_count = getStateCounts(state);
-  if (count != NULL) {
+  if (count != nullptr) {
     *count = tmp_count;
   }
   /* If openonly, we always ignore states that don't at least have open
@@ -871,7 +871,7 @@ bool PortList::isIgnoredState(int state, int *count) const {
 int PortList::numIgnoredStates() const {
   int numstates = 0;
   for(int state=0; state < PORT_HIGHEST_STATE; state++) {
-    if (isIgnoredState(state, NULL))
+    if (isIgnoredState(state, nullptr))
       numstates++;
   }
   return numstates;
@@ -907,7 +907,7 @@ bool PortList::hasOpenPorts() const {
 /* Returns true if service scan is done and portno is found to be tcpwrapped, false otherwise */
 bool PortList::isTCPwrapped(u16 portno) const {
   const Port *port = lookupPort(portno, IPPROTO_TCP);
-  if (port == NULL) {
+  if (port == nullptr) {
     if (o.debugging > 1) {
       log_write(LOG_STDOUT, "PortList::isTCPwrapped(%d) requested but port not in list\n", portno);
     }
@@ -917,12 +917,12 @@ bool PortList::isTCPwrapped(u16 portno) const {
       log_write(LOG_STDOUT, "PortList::isTCPwrapped(%d) requested but service scan was never asked to be done\n", portno);
     }
     return false;
-  } else if (port->service == NULL) {
+  } else if (port->service == nullptr) {
     if (o.debugging > 1) {
       log_write(LOG_STDOUT, "PortList::isTCPwrapped(%d) requested but port has not been service scanned yet\n", portno);
     }
     return false;
-  } else if (port->service->name == NULL) {
+  } else if (port->service->name == nullptr) {
     // no service match and port not listed in services file
     if (o.debugging > 1) {
       log_write(LOG_STDOUT, "PortList::isTCPwrapped(%d) requested but service has no name\n", portno);
@@ -935,7 +935,7 @@ bool PortList::isTCPwrapped(u16 portno) const {
 
 int PortList::setStateReason(u16 portno, u8 proto, reason_t reason, u8 ttl,
   const struct sockaddr_storage *ip_addr) {
-    Port *answer = NULL;
+    Port *answer = nullptr;
 
     answer = createPort(portno, proto);
     return setStateReason(answer, reason, ttl, ip_addr);
@@ -945,7 +945,7 @@ int PortList::setStateReason(Port *answer, reason_t reason, u8 ttl,
   const struct sockaddr_storage *ip_addr) {
     /* set new reason and increment its count */
     answer->reason.reason_id = reason;
-    if (ip_addr == NULL)
+    if (ip_addr == nullptr)
       answer->reason.ip_addr.sockaddr.sa_family = AF_UNSPEC;
     else
       answer->reason.set_ip_addr(ip_addr);
@@ -1013,4 +1013,3 @@ const char *statenum2str(int state) {
   }
   return "unknown";
 }
-

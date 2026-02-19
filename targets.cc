@@ -76,6 +76,8 @@
 #include "nmap_error.h"
 #include "output.h"
 
+#include <memory>
+
 extern NmapOps o;
 
 /* Conducts an ARP ping sweep of the given hosts to determine which ones
@@ -84,38 +86,38 @@ static void arpping(Target *hostbatch[], int num_hosts) {
   /* First I change hostbatch into a std::vector<Target *>, which is what ultra_scan
      takes.  I remove hosts that cannot be ARP scanned (such as localhost) */
   std::vector<Target *> targets;
-  int targetno;
   targets.reserve(num_hosts);
 
   /* Default timeout should be much lower for arp */
   int default_to = box(o.minRttTimeout(), o.initialRttTimeout(), INITIAL_ARP_RTT_TIMEOUT) * 1000;
-  for (targetno = 0; targetno < num_hosts; targetno++) {
-    initialize_timeout_info(&hostbatch[targetno]->to);
-    hostbatch[targetno]->to.timeout = default_to;
-    if (!hostbatch[targetno]->SrcMACAddress()) {
-      bool islocal = islocalhost(hostbatch[targetno]->TargetSockAddr());
+  for (Target **target_it = hostbatch; target_it != hostbatch + num_hosts; ++target_it) {
+    Target *target = *target_it;
+    initialize_timeout_info(&target->to);
+    target->to.timeout = default_to;
+    if (!target->SrcMACAddress()) {
+      bool islocal = islocalhost(target->TargetSockAddr());
       if (islocal) {
         log_write(LOG_STDOUT|LOG_NORMAL,
                   "ARP ping: Considering %s UP because it is a local IP, despite no MAC address for device %s\n",
-                  hostbatch[targetno]->NameIP(), hostbatch[targetno]->deviceName());
-        hostbatch[targetno]->flags = HOST_UP;
+                  target->NameIP(), target->deviceName());
+        target->flags = HOST_UP;
       } else {
         log_write(LOG_STDOUT|LOG_NORMAL,
                   "ARP ping: Considering %s DOWN because no MAC address found for device %s.\n",
-                  hostbatch[targetno]->NameIP(),
-                  hostbatch[targetno]->deviceName());
-        hostbatch[targetno]->flags = HOST_DOWN;
+                  target->NameIP(),
+                  target->deviceName());
+        target->flags = HOST_DOWN;
       }
       continue;
     }
-    targets.push_back(hostbatch[targetno]);
+    targets.push_back(target);
   }
   if (!targets.empty()) {
     if (targets[0]->af() == AF_INET)
-      ultra_scan(targets, NULL, PING_SCAN_ARP);
+      ultra_scan(targets, nullptr, PING_SCAN_ARP);
     else {
       assert(targets[0]->af() == AF_INET6);
-      ultra_scan(targets, NULL, PING_SCAN_ND);
+      ultra_scan(targets, nullptr, PING_SCAN_ND);
     }
   }
   return;
@@ -188,10 +190,10 @@ static void massping(Target *hostbatch[], int num_hosts, const struct scan_lists
 
   /* Get the name of the interface used to send to this group. We assume the
      device used to send to the first target is used to send to all of them. */
-  device_name = NULL;
+  device_name = nullptr;
   if (num_hosts > 0)
     device_name = hostbatch[0]->deviceName();
-  if (device_name == NULL)
+  if (device_name == nullptr)
     device_name = "";
 
   /* group_to is a static variable that keeps track of group timeout values
@@ -229,7 +231,7 @@ bool target_needs_new_hostgroup(Target **targets, int targets_sz, const Target *
     return false;
 
   /* There are no restrictions on non-root scans. */
-  if (!(o.isr00t && target->deviceName() != NULL))
+  if (!(o.isr00t && target->deviceName() != nullptr))
     return false;
 
   /* Different address family? */
@@ -237,8 +239,8 @@ bool target_needs_new_hostgroup(Target **targets, int targets_sz, const Target *
     return true;
 
   /* Different interface name? */
-  if (targets[0]->deviceName() != NULL &&
-      target->deviceName() != NULL &&
+  if (targets[0]->deviceName() != nullptr &&
+      target->deviceName() != nullptr &&
       strcmp(targets[0]->deviceName(), target->deviceName()) != 0) {
     return true;
   }
@@ -303,7 +305,7 @@ const char *HostGroupState::next_expression() {
   if (o.max_ips_to_scan == 0 || o.numhosts_scanned + this->current_batch_sz < o.max_ips_to_scan) {
     const char *expr;
     expr = grab_next_host_spec(o.inputfd, this->argc, this->argv);
-    if (expr != NULL)
+    if (expr != nullptr)
       return expr;
   }
 
@@ -329,7 +331,7 @@ const char *HostGroupState::next_expression() {
   }
 #endif
 
-  return NULL;
+  return nullptr;
 }
 
 /* Returns a newly allocated Target with the given address. Handles all the
@@ -338,9 +340,7 @@ static Target *setup_target(const HostGroupState *hs,
                             const struct sockaddr_storage *ss, size_t sslen,
                             int pingtype) {
   struct route_nfo rnfo;
-  Target *t;
-
-  t = new Target();
+  auto t = std::make_unique<Target>();
 
   t->setTargetSockAddr(ss, sslen);
 
@@ -390,11 +390,10 @@ static Target *setup_target(const HostGroupState *hs,
     // printf("Target %s %s directly connected, goes through local iface %s, which %s ethernet\n", t->NameIP(), t->directlyConnected()? "IS" : "IS NOT", t->deviceName(), (t->ifType() == devt_ethernet)? "IS" : "IS NOT");
   }
 
-  return t;
+  return t.release();
 
 bail:
-  delete t;
-  return NULL;
+  return nullptr;
 }
 
 bool HostGroupState::get_next_host(struct sockaddr_storage *ss, size_t *sslen, struct addrset *exclude_group) {
@@ -437,7 +436,7 @@ tryagain:
 
   if (!hs->get_next_host(&ss, &sslen, exclude_group)) {
     /* That's the last of them. */
-    return NULL;
+    return nullptr;
   }
 
   assert(ss.ss_family == o.af());
@@ -452,7 +451,7 @@ tryagain:
   }
 
   t = setup_target(hs, &ss, sslen, pingtype);
-  if (t == NULL)
+  if (t == nullptr)
     goto tryagain;
 
   if (o.unique) {
@@ -474,7 +473,7 @@ static void refresh_hostbatch(HostGroupState *hs, struct addrset *exclude_group,
     Target *t;
 
     t = next_target(hs, exclude_group, ports, pingtype);
-    if (t == NULL)
+    if (t == nullptr)
       break;
 
     /* Does this target need to go in a separate host group? */
@@ -498,7 +497,7 @@ static void refresh_hostbatch(HostGroupState *hs, struct addrset *exclude_group,
     hoststructfry(hs->hostbatch, hs->current_batch_sz);
   }
 
-  gettimeofday(&now, NULL);
+  gettimeofday(&now, nullptr);
   Target *current_target = hs->hostbatch[0];
 
   /* If there's a chance we can do ARP ping or may need the MAC address,
@@ -558,7 +557,7 @@ Target *nexthost(HostGroupState *hs, struct addrset *exclude_group,
   if (hs->next_batch_no >= hs->current_batch_sz)
     refresh_hostbatch(hs, exclude_group, ports, pingtype);
   if (hs->next_batch_no >= hs->current_batch_sz)
-    return NULL;
+    return nullptr;
 
   return hs->hostbatch[hs->next_batch_no++];
 }

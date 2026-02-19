@@ -279,6 +279,7 @@ public:
   GroupScanStats(UltraScanInfo *UltraSI);
   ~GroupScanStats();
   void probeSent(unsigned int nbytes);
+  void checkGlobalRateLimit();
   /* Returns true if the GLOBAL system says that sending is OK. */
   bool sendOK(struct timeval *when) const;
   /* Total # of probes outstanding (active) for all Hosts */
@@ -318,6 +319,13 @@ public:
   int probes_sent_at_last_wait;
   // number of hosts that timed out during scan, or were already timedout
   int num_hosts_timedout;
+  /* Global rate-limit detection */
+  unsigned int ratelimit_window_sent; /* Probes sent in current window */
+  unsigned int ratelimit_window_recv; /* Responses received in current window */
+  unsigned int ratelimit_window_icmp_unreach; /* ICMP unreachable count in window */
+  unsigned int ratelimit_rst_count; /* TCP RST count in window */
+  struct timeval ratelimit_window_start; /* Start of current measurement window */
+  unsigned int ratelimit_backoffs; /* Number of times global cwnd was backed off */
   ConnectScanInfo *CSI;
 };
 
@@ -703,4 +711,3 @@ void ultrascan_ping_update(UltraScanInfo *USI, HostScanStats *hss,
                                   const struct timeval *rcvdtime,
                                   bool adjust_timing = true);
 #endif /* SCAN_ENGINE_H */
-

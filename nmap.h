@@ -112,7 +112,7 @@
 #endif
 
 #ifndef NMAP_NAME
-#define NMAP_NAME "Nmap"
+#define NMAP_NAME "znmap"
 #endif
 #define NMAP_URL "https://nmap.org"
 

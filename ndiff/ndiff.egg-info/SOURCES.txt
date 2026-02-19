@@ -1,0 +1,9 @@
+LICENSE
+README
+ndiff.py
+pyproject.toml
+ndiff.egg-info/PKG-INFO
+ndiff.egg-info/SOURCES.txt
+ndiff.egg-info/dependency_links.txt
+ndiff.egg-info/entry_points.txt
+ndiff.egg-info/top_level.txt

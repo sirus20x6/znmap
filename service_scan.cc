@@ -108,13 +108,16 @@
 #endif
 
 #include <algorithm>
+#include <iterator>
 #include <list>
+#include <optional>
+#include <string_view>
 
 extern NmapOps o;
 
-#define SERVICE_FIELD_LEN 80
-#define SERVICE_EXTRA_LEN 256
-#define SERVICE_TYPE_LEN 32
+constexpr int kServiceFieldLen = 80;
+constexpr int kServiceExtraLen = 256;
+constexpr int kServiceTypeLen = 32;
 // Details on a particular service (open port) we are trying to match
 class ServiceNFO {
 public:
@@ -142,20 +145,21 @@ public:
   const char *probe_matched;
   // If a match is found, any product/version/info/hostname/ostype/devicetype
   // is placed in these 6 strings.  Otherwise the string will be 0 length.
-  char product_matched[SERVICE_FIELD_LEN];
-  char version_matched[SERVICE_FIELD_LEN];
-  char extrainfo_matched[SERVICE_EXTRA_LEN];
-  char hostname_matched[SERVICE_FIELD_LEN];
-  char ostype_matched[SERVICE_TYPE_LEN];
-  char devicetype_matched[SERVICE_TYPE_LEN];
-  char cpe_a_matched[SERVICE_FIELD_LEN];
-  char cpe_h_matched[SERVICE_FIELD_LEN];
-  char cpe_o_matched[SERVICE_FIELD_LEN];
+  char product_matched[kServiceFieldLen];
+  char version_matched[kServiceFieldLen];
+  char extrainfo_matched[kServiceExtraLen];
+  char hostname_matched[kServiceFieldLen];
+  char ostype_matched[kServiceTypeLen];
+  char devicetype_matched[kServiceTypeLen];
+  char cpe_a_matched[kServiceFieldLen];
+  char cpe_h_matched[kServiceFieldLen];
+  char cpe_o_matched[kServiceFieldLen];
   enum service_tunnel_type tunnel; /* SERVICE_TUNNEL_NONE, SERVICE_TUNNEL_SSL */
   // This stores our SSL session id, which will help speed up subsequent
   // SSL connections.  It's overwritten each time.  void* is used so we don't
   // need to #ifdef HAVE_OPENSSL all over.  We'll cast later as needed.
   void *ssl_session;
+  bool tls_alpn_h2;
   // if a match was found (see above), this tells whether it was a "soft"
   // or hard match.  It is always false if no match has been found.
   bool softMatchFound;
@@ -201,7 +205,7 @@ private:
   // written if there is enough space.  Otherwise it exits.
   void addServiceChar(char c, int wrapat);
   // Like addServiceChar, but for a whole zero-terminated string
-  void addServiceString(const char *s, int wrapat);
+  void addServiceString(std::string_view s, int wrapat);
   std::vector<ServiceProbe *>::iterator current_probe;
   u8 *currentresp;
   int currentresplen;
@@ -224,21 +228,21 @@ public:
   bool busy; // Recursion guard; if true, don't start any new events
 };
 
-#define SUBSTARGS_MAX_ARGS 5
-#define SUBSTARGS_STRLEN 128
-#define SUBSTARGS_ARGTYPE_NONE 0
-#define SUBSTARGS_ARGTYPE_STRING 1
-#define SUBSTARGS_ARGTYPE_INT 2
+constexpr int kSubstArgsMaxArgs = 5;
+constexpr int kSubstArgsStrLen = 128;
+constexpr int kSubstArgsArgTypeNone = 0;
+constexpr int kSubstArgsArgTypeString = 1;
+constexpr int kSubstArgsArgTypeInt = 2;
 struct substargs {
   int num_args; // Total number of arguments found
-  char str_args[SUBSTARGS_MAX_ARGS][SUBSTARGS_STRLEN];
+  char str_args[kSubstArgsMaxArgs][kSubstArgsStrLen];
   // This is the length of each string arg, since they can contain zeros.
   // The str_args[] are zero-terminated for convenience in the cases where
   // you know they won't contain zero.
-  int str_args_len[SUBSTARGS_MAX_ARGS];
-  int int_args[SUBSTARGS_MAX_ARGS];
+  int str_args_len[kSubstArgsMaxArgs];
+  int int_args[kSubstArgsMaxArgs];
   // The type of each argument -- see #define's above.
-  int arg_types[SUBSTARGS_MAX_ARGS];
+  int arg_types[kSubstArgsMaxArgs];
 };
 
 /********************   PROTOTYPES *******************/
@@ -248,7 +252,7 @@ static void servicescan_connect_handler(nsock_pool nsp, nsock_event nse, void *m
 static void end_svcprobe(enum serviceprobestate probe_state, ServiceGroup *SG, ServiceNFO *svc, nsock_iod nsi);
 static int scanThroughTunnel(ServiceNFO *svc);
 static bool processMatch(const struct MatchDetails *MD, ServiceNFO *svc,
-    const char *probeName, const char *fallbackName);
+    std::string_view probeName, std::string_view fallbackName);
 
 ServiceProbeMatch::ServiceProbeMatch() {
   deflineno = -1;
@@ -265,7 +269,6 @@ ServiceProbeMatch::ServiceProbeMatch() {
 }
 
 ServiceProbeMatch::~ServiceProbeMatch() {
-  std::vector<char *>::iterator it;
   if (!isInitialized) return;
   if (matchstr) free(matchstr);
   if (product_template) free(product_template);
@@ -274,8 +277,8 @@ ServiceProbeMatch::~ServiceProbeMatch() {
   if (hostname_template) free(hostname_template);
   if (ostype_template) free(ostype_template);
   if (devicetype_template) free(devicetype_template);
-  for (it = cpe_templates.begin(); it != cpe_templates.end(); it++)
-    free(*it);
+  for (auto *tmpl : cpe_templates)
+    free(tmpl);
   if (regex_compiled)
   {
     pcre2_code_free(regex_compiled);
@@ -336,9 +339,11 @@ static bool next_template(const char **matchtext, char modestr[4], char **tmplt,
 
   delimchar = *q;
 
-  q = strchr(q + 1, delimchar);
-  if (q == NULL)
+  if (const char *delim_pos = strchr(q + 1, delimchar); delim_pos != NULL) {
+    q = delim_pos;
+  } else {
     fatal("%s: parse error (missing end delimiter) on line %d of nmap-service-probes", __func__, lineno);
+  }
 
   *tmplt = mkstr(p, q);
 
@@ -522,13 +527,13 @@ void ServiceProbeMatch::InitMatch(const char *matchtext, int lineno) {
   // NULL.
 const struct MatchDetails *ServiceProbeMatch::testMatch(const u8 *buf, int buflen) {
   int rc;
-  static char product[SERVICE_FIELD_LEN];
-  static char version[SERVICE_FIELD_LEN];
-  static char info[SERVICE_EXTRA_LEN];  /* We will truncate with ... later */
-  static char hostname[SERVICE_FIELD_LEN];
-  static char ostype[SERVICE_TYPE_LEN];
-  static char devicetype[SERVICE_TYPE_LEN];
-  static char cpe_a[SERVICE_FIELD_LEN], cpe_h[SERVICE_FIELD_LEN], cpe_o[SERVICE_FIELD_LEN];
+  static char product[kServiceFieldLen];
+  static char version[kServiceFieldLen];
+  static char info[kServiceExtraLen];  /* We will truncate with ... later */
+  static char hostname[kServiceFieldLen];
+  static char ostype[kServiceTypeLen];
+  static char devicetype[kServiceTypeLen];
+  static char cpe_a[kServiceFieldLen], cpe_h[kServiceFieldLen], cpe_o[kServiceFieldLen];
   char *bufc = (char *) buf;
   assert(isInitialized);
 
@@ -545,7 +550,7 @@ const struct MatchDetails *ServiceProbeMatch::testMatch(const u8 *buf, int bufle
         error("Warning: PCRE2 error %d when probing for service %s with the regex '%s'", rc, servicename, matchstr);
       }
       if (o.debugging) {
-        pcre2_get_error_message(rc, (unsigned char *)info, SERVICE_EXTRA_LEN);
+        pcre2_get_error_message(rc, (unsigned char *)info, kServiceExtraLen);
         error("PCRE2 error message: %s", info);
         if (o.debugging > 1) {
           error("Service data: \n%s", hexdump(buf, buflen));
@@ -599,14 +604,14 @@ static int getsubstcommandargs(struct substargs *args, char *args_start,
     else if (*args_start == '"') {
       // OK - it is a string
       // Do we have space for another arg?
-      if (args->num_args == SUBSTARGS_MAX_ARGS)
+      if (args->num_args == kSubstArgsMaxArgs)
         return -1;
       do {
         args_start++;
         if (*args_start == '"' && (*(args_start - 1) != '\\' || *(args_start - 2) == '\\'))
           break;
         len = args->str_args_len[args->num_args];
-        if (len >= SUBSTARGS_STRLEN - 1)
+        if (len >= kSubstArgsStrLen - 1)
           return -1;
         args->str_args[args->num_args][len] = *args_start;
         args->str_args_len[args->num_args]++;
@@ -617,7 +622,7 @@ static int getsubstcommandargs(struct substargs *args, char *args_start,
       if (!cstring_unescape(args->str_args[args->num_args], &len))
         return -1;
       args->str_args_len[args->num_args] = len;
-      args->arg_types[args->num_args] = SUBSTARGS_ARGTYPE_STRING;
+      args->arg_types[args->num_args] = kSubstArgsArgTypeString;
       args->num_args++;
       args_start++;
       args_start = strpbrk(args_start, ",)");
@@ -628,7 +633,7 @@ static int getsubstcommandargs(struct substargs *args, char *args_start,
       args->int_args[args->num_args] = (int) strtol(args_start, &p, 0);
       if (p <= args_start) return -1;
       args_start = p;
-      args->arg_types[args->num_args] = SUBSTARGS_ARGTYPE_INT;
+      args->arg_types[args->num_args] = kSubstArgsArgTypeInt;
       args->num_args++;
       args_start = strpbrk(args_start, ",)");
       if (!args_start) return -1;
@@ -763,7 +768,7 @@ static char *substvar(char *tmplvar, char **tmplvarend,
     strbuf_append(&result, &n, &len, (const char *) subject + offstart, offend - offstart);
   } else if (strcmp(substcommand, "P") == 0) {
     if (command_args.num_args != 1 ||
-        command_args.arg_types[0] != SUBSTARGS_ARGTYPE_INT) {
+        command_args.arg_types[0] != kSubstArgsArgTypeInt) {
       return NULL;
     }
     subnum = command_args.int_args[0];
@@ -785,9 +790,9 @@ static char *substvar(char *tmplvar, char **tmplvarend,
     char *findstr, *replstr;
     int findstrlen, replstrlen;
     if (command_args.num_args != 3 ||
-        command_args.arg_types[0] != SUBSTARGS_ARGTYPE_INT ||
-        command_args.arg_types[1] != SUBSTARGS_ARGTYPE_STRING ||
-        command_args.arg_types[2] != SUBSTARGS_ARGTYPE_STRING) {
+        command_args.arg_types[0] != kSubstArgsArgTypeInt ||
+        command_args.arg_types[1] != kSubstArgsArgTypeString ||
+        command_args.arg_types[2] != kSubstArgsArgTypeString) {
       return NULL;
     }
     subnum = command_args.int_args[0];
@@ -819,8 +824,8 @@ static char *substvar(char *tmplvar, char **tmplvarend,
     char buf[24]; //0xffffffffffffffff = 18446744073709551615, 20 chars
     int buflen;
     if (command_args.num_args != 2 ||
-        command_args.arg_types[0] != SUBSTARGS_ARGTYPE_INT ||
-        command_args.arg_types[1] != SUBSTARGS_ARGTYPE_STRING ||
+        command_args.arg_types[0] != kSubstArgsArgTypeInt ||
+        command_args.arg_types[1] != kSubstArgsArgTypeString ||
         command_args.str_args_len[1] != 1) {
       return NULL;
     }
@@ -1054,12 +1059,12 @@ int ServiceProbeMatch::getVersionStr(const u8 *subject, size_t subjectlen,
 
   /* There may be multiple cpe templates. We peek at the first character and
      store in cpe_a, cpe_h, or cpe_o as appropriate. */
-  for (unsigned int i = 0; i < cpe_templates.size(); i++) {
+  for (auto *cpe_template : cpe_templates) {
     char *cpe;
     size_t cpelen;
     int part;
 
-    part = cpe_get_part(cpe_templates[i]);
+    part = cpe_get_part(cpe_template);
     switch (part) {
     case 'a':
       cpe = cpe_a;
@@ -1079,10 +1084,10 @@ int ServiceProbeMatch::getVersionStr(const u8 *subject, size_t subjectlen,
       continue;
       break;
     }
-    rc = dotmplsubst(subject, subjectlen, match_data, cpe_templates[i], cpe, cpelen, transform_cpe);
+    rc = dotmplsubst(subject, subjectlen, match_data, cpe_template, cpe, cpelen, transform_cpe);
     if (rc != 0) {
       error("Warning: Servicescan failed to fill cpe_%c (subjectlen: %lu, cpelen: %lu). Too long? Match string was line %d: %s", part, subjectlen, cpelen, deflineno,
-            (cpe_templates[i])? cpe_templates[i] : "");
+            cpe_template ? cpe_template : "");
       if (cpelen > 0) *cpe = '\0';
       retval = -1;
     }
@@ -1093,7 +1098,6 @@ int ServiceProbeMatch::getVersionStr(const u8 *subject, size_t subjectlen,
 
 
 ServiceProbe::ServiceProbe() {
-  int i;
   probename = NULL;
   probestring = NULL;
   totalwaitms = DEFAULT_SERVICEWAITMS;
@@ -1104,18 +1108,15 @@ ServiceProbe::ServiceProbe() {
   rarity = 5;
   notForPayload = false;
   fallbackStr = NULL;
-  for (i=0; i<MAXFALLBACKS+1; i++) fallbacks[i] = NULL;
+  for (auto &fallback : fallbacks) fallback = NULL;
   probeFilter = probe_filter_init();
   acAutomaton = ac_create();
   acBuilt = false;
 }
 
 ServiceProbe::~ServiceProbe() {
-  std::vector<ServiceProbeMatch *>::iterator vi;
-
-  for(vi = matches.begin(); vi != matches.end(); vi++) {
-    delete *vi;
-  }
+  for (auto *match : matches)
+    delete match;
 
   if (probeFilter) probe_filter_free(probeFilter);
   if (acAutomaton) ac_destroy(acAutomaton);
@@ -1271,10 +1272,8 @@ bool ServiceProbe::portIsProbable(enum service_tunnel_type tunnel, u16 portno) c
  // Returns true if the passed in service name is among those that can
   // be detected by the matches in this probe;
 bool ServiceProbe::serviceIsPossible(const char *sname) const {
-  std::vector<const char *>::const_iterator vi;
-
-  for(vi = detectedServices.begin(); vi != detectedServices.end(); vi++) {
-    if (strcmp(*vi, sname) == 0)
+  for (const auto *detected : detectedServices) {
+    if (strcmp(detected, sname) == 0)
       return true;
   }
   return false;
@@ -1501,12 +1500,9 @@ AllProbes::AllProbes() {
 }
 
 AllProbes::~AllProbes() {
-  std::vector<ServiceProbe *>::iterator vi;
-
   // Delete all the ServiceProbe's inside the probes vector
-  for(vi = probes.begin(); vi != probes.end(); vi++) {
-    delete *vi;
-  }
+  for (auto *probe : probes)
+    delete probe;
   if(nullProbe)
     delete nullProbe;
   free_scan_lists(&excludedports);
@@ -1517,22 +1513,20 @@ AllProbes::~AllProbes() {
   // protocol it will try to find matches on any protocol.
   // It can return the NULL probe.
 ServiceProbe *AllProbes::getProbeByName(const char *name, int proto) const {
-  std::vector<ServiceProbe *>::const_iterator vi;
-
   if (proto == IPPROTO_TCP && nullProbe && strcmp(nullProbe->getName(), name) == 0)
     return nullProbe;
 
-  for(vi = probes.begin(); vi != probes.end(); vi++) {
-    if ((*vi)->getProbeProtocol() == proto &&
-        strcmp(name, (*vi)->getName()) == 0)
-      return *vi;
+  for (auto *probe : probes) {
+    if (probe->getProbeProtocol() == proto &&
+        strcmp(name, probe->getName()) == 0)
+      return probe;
   }
 
   // Since the probe wasn't matched for the requested protocol, now try to
   // find a match regardless of protocol
-  for(vi = probes.begin(); vi != probes.end(); vi++) {
-    if (strcmp(name, (*vi)->getName()) == 0)
-      return *vi;
+  for (auto *probe : probes) {
+    if (strcmp(name, probe->getName()) == 0)
+      return probe;
   }
 
   return NULL;
@@ -1548,7 +1542,7 @@ ServiceProbe *AllProbes::getProbeByName(const char *name, int proto) const {
 // scan protocols.
 int AllProbes::isExcluded(unsigned short port, int proto) const {
   unsigned short *p=NULL;
-  int count=-1,i;
+  int count=-1;
 
   if (!excluded_seen) return 0;
 
@@ -1565,9 +1559,10 @@ int AllProbes::isExcluded(unsigned short port, int proto) const {
     fatal("Bad proto number (%d) specified in %s", proto, __func__);
   }
 
-  for (i=0; i<count; i++)
-    if (p[i] == port)
-           return 1;
+  for (const auto *current = p; current != p + count; ++current) {
+    if (*current == port)
+      return 1;
+  }
 
   return 0;
 }
@@ -1581,53 +1576,48 @@ int AllProbes::isExcluded(unsigned short port, int proto) const {
 // back to probes later in the file. This function also free()s all the
 // fallbackStrs.
 void AllProbes::compileFallbacks() {
-  std::vector<ServiceProbe *>::iterator curr;
   char *tp;
   int i;
-
-  curr = probes.begin();
 
   // The NULL probe is a special case:
   if (nullProbe != NULL)
     nullProbe->fallbacks[0] = nullProbe;
 
-  while (curr != probes.end()) {
+  for (auto *probe : probes) {
 
-    if ((*curr)->fallbackStr == NULL) {
+    if (probe->fallbackStr == NULL) {
       // A non-NULL probe without a fallback directive. We
       // just use "Itself,NULL" unless it's UDP, then just "Itself".
 
-      (*curr)->fallbacks[0] = *curr;
-      if ((*curr)->getProbeProtocol() == IPPROTO_TCP)
-        (*curr)->fallbacks[1] = nullProbe;
+      probe->fallbacks[0] = probe;
+      if (probe->getProbeProtocol() == IPPROTO_TCP)
+        probe->fallbacks[1] = nullProbe;
     } else {
       // A non-NULL probe *with* a fallback directive. We use:
       // TCP: "Itself,<directive1>,...,<directiveN>,NULL"
       // UDP: "Itself,<directive1>,...,<directiveN>"
 
-      (*curr)->fallbacks[0] = *curr;
+      probe->fallbacks[0] = probe;
       i = 1;
-      tp = strtok((*curr)->fallbackStr, ",\r\n\t "); // \r and \n because string will be terminated with them
+      tp = strtok(probe->fallbackStr, ",\r\n\t "); // \r and \n because string will be terminated with them
 
       while (tp != NULL && i<(MAXFALLBACKS-1)) {
-        (*curr)->fallbacks[i] = getProbeByName(tp, (*curr)->getProbeProtocol());
-        if ((*curr)->fallbacks[i] == NULL)
-          fatal("%s: Unknown fallback specified in Probe %s: '%s'", __func__, (*curr)->getName(), tp);
+        probe->fallbacks[i] = getProbeByName(tp, probe->getProbeProtocol());
+        if (probe->fallbacks[i] == NULL)
+          fatal("%s: Unknown fallback specified in Probe %s: '%s'", __func__, probe->getName(), tp);
         i++;
         tp = strtok(NULL, ",\r\n\t ");
       }
 
       if (i == MAXFALLBACKS-1)
-        fatal("%s: MAXFALLBACKS exceeded on probe '%s'", __func__, (*curr)->getName());
+        fatal("%s: MAXFALLBACKS exceeded on probe '%s'", __func__, probe->getName());
 
-      if ((*curr)->getProbeProtocol() == IPPROTO_TCP)
-        (*curr)->fallbacks[i] = nullProbe;
+      if (probe->getProbeProtocol() == IPPROTO_TCP)
+        probe->fallbacks[i] = nullProbe;
     }
 
-    if ((*curr)->fallbackStr) free((*curr)->fallbackStr);
-    (*curr)->fallbackStr = NULL;
-
-    curr++;
+    if (probe->fallbackStr) free(probe->fallbackStr);
+    probe->fallbackStr = NULL;
   }
 
 }
@@ -1648,6 +1638,7 @@ ServiceNFO::ServiceNFO(AllProbes *newAP) {
   cpe_a_matched[0] = cpe_h_matched[0] = cpe_o_matched[0] = '\0';
   tunnel = SERVICE_TUNNEL_NONE;
   ssl_session = NULL;
+  tls_alpn_h2 = false;
   softMatchFound = false;
   servicefplen = servicefpalloc = 0;
   servicefp = NULL;
@@ -1685,9 +1676,9 @@ void ServiceNFO::addServiceChar(const char c, int wrapat) {
 }
 
 // Like addServiceChar, but for a whole zero-terminated string
-void ServiceNFO::addServiceString(const char *s, int wrapat) {
-  while(*s)
-    addServiceChar(*s++, wrapat);
+void ServiceNFO::addServiceString(std::string_view s, int wrapat) {
+  for (const char c : s)
+    addServiceChar(c, wrapat);
 }
 
 // If a service responds to a given probeName, this function adds the
@@ -1697,7 +1688,8 @@ void ServiceNFO::addServiceString(const char *s, int wrapat) {
 void ServiceNFO::addToServiceFingerprint(const char *probeName, const u8 *resp,
                                          int resplen) {
   int spaceleft = servicefpalloc - servicefplen;
-  int servicewrap=74; // Wrap after 74 chars / line
+  constexpr int kServiceWrap = 74; // Wrap after 74 chars / line
+  const int servicewrap = kServiceWrap;
   int respused = MIN(resplen, (o.debugging)? 1300 : 900); // truncate to reasonable size
   // every char could require \xHH escape, plus there is the matter of
   // "\nSF:" for each line, plus "%r(probename,probelen,"") Oh, and
@@ -1958,7 +1950,6 @@ u8 *ServiceNFO::getcurrentproberesponse(int *respstrlen) {
 
 
 ServiceGroup::ServiceGroup(std::vector<Target *> &Targets, AllProbes *AP) {
-  unsigned int targetno;
   ServiceNFO *svc;
   Port *nxtport;
   Port port;
@@ -1968,8 +1959,7 @@ ServiceGroup::ServiceGroup(std::vector<Target *> &Targets, AllProbes *AP) {
   gettimeofday(&now, NULL);
 
   SPM = new ScanProgressMeter("Service scan");
-  for(targetno = 0 ; targetno < Targets.size(); targetno++) {
-    Target *target = Targets[targetno];
+  for (auto *target : Targets) {
     assert(target);
     nxtport = NULL;
     if (target->timedOut(&now)) {
@@ -1996,17 +1986,14 @@ ServiceGroup::ServiceGroup(std::vector<Target *> &Targets, AllProbes *AP) {
     }
 
     /* Check if any early responses can help */
-    for (std::vector<EarlySvcResponse *>::iterator it = target->earlySvcResponses.begin();
-        it != target->earlySvcResponses.end(); it++) {
-      EarlySvcResponse *esr = *it;
+    for (auto *esr : target->earlySvcResponses) {
       assert(esr);
       const struct MatchDetails *MD = payload_service_match(esr->pspec.pd.udp.dport,
           esr->data, esr->len);
       if (MD) {
         // Find the appropriate ServiceNFO and process it.
-        for (std::list<ServiceNFO *>::iterator i = services_remaining.begin();
-            i != services_remaining.end(); i++) {
-          svc = *i;
+        for (auto *remaining_svc : services_remaining) {
+          svc = remaining_svc;
           if (svc->proto == IPPROTO_UDP && svc->portno == esr->pspec.pd.udp.dport) {
             if (processMatch(MD, svc, "port scan", "udp payload")
                 && !scanThroughTunnel(svc)) {
@@ -2032,16 +2019,12 @@ ServiceGroup::ServiceGroup(std::vector<Target *> &Targets, AllProbes *AP) {
 }
 
 ServiceGroup::~ServiceGroup() {
-  std::list<ServiceNFO *>::iterator i;
-
-  for(i = services_finished.begin(); i != services_finished.end(); i++)
-    delete *i;
-
-  for(i = services_in_progress.begin(); i != services_in_progress.end(); i++)
-    delete *i;
-
-  for(i = services_remaining.begin(); i != services_remaining.end(); i++)
-    delete *i;
+  for (auto *svc : services_finished)
+    delete svc;
+  for (auto *svc : services_in_progress)
+    delete svc;
+  for (auto *svc : services_remaining)
+    delete svc;
 
   delete SPM;
 }
@@ -2221,6 +2204,7 @@ static int scanThroughTunnel(ServiceNFO *svc) {
   svc->product_matched[0] = svc->version_matched[0] = svc->extrainfo_matched[0] = '\0';
   svc->hostname_matched[0] = svc->ostype_matched[0] = svc->devicetype_matched[0] = '\0';
   svc->cpe_a_matched[0] = svc->cpe_h_matched[0] = svc->cpe_o_matched[0] = '\0';
+  svc->tls_alpn_h2 = false;
   svc->softMatchFound = false;
    svc->resetProbes(true);
   return 1;
@@ -2250,20 +2234,19 @@ static void considerPrintingStats(ServiceGroup *SG) {
 /* Check if target is done (no more probes remaining for it in service group),
    and responds appropriately if so */
 static void handleHostIfDone(ServiceGroup *SG, Target *target) {
-  std::list<ServiceNFO *>::const_iterator svcI;
   bool found = false;
 
-  for(svcI = SG->services_in_progress.begin();
-      svcI != SG->services_in_progress.end(); svcI++) {
-    if ((*svcI)->target == target) {
+  for (const auto *svc : SG->services_in_progress) {
+    if (svc->target == target) {
       found = true;
       break;
     }
   }
 
-  for(svcI = SG->services_remaining.begin();
-      !found && svcI != SG->services_remaining.end(); svcI++) {
-    if ((*svcI)->target == target) {
+  for (const auto *svc : SG->services_remaining) {
+    if (found)
+      break;
+    if (svc->target == target) {
       found = true;
       break;
     }
@@ -2282,23 +2265,20 @@ static void handleHostIfDone(ServiceGroup *SG, Target *target) {
 // set it to the given probe_state pass NULL for nsi if you don't want
 // it to be deleted (for example, if you already have done so).
 static void end_svcprobe(enum serviceprobestate probe_state, ServiceGroup *SG, ServiceNFO *svc, nsock_iod nsi) {
-  std::list<ServiceNFO *>::iterator member;
   Target *target = svc->target;
 
   svc->probe_state = svc->tcpwrap_possible ? PROBESTATE_FINISHED_TCPWRAPPED : probe_state;
-  member = find(SG->services_in_progress.begin(), SG->services_in_progress.end(),
-                  svc);
-  if (member != SG->services_in_progress.end()) {
+  if (auto member = find(SG->services_in_progress.begin(), SG->services_in_progress.end(), svc);
+      member != SG->services_in_progress.end()) {
     assert(*member == svc);
     SG->services_in_progress.erase(member);
   } else {
     /* A probe can finish from services_remaining if the host times out before the
        probe has even started */
-    member = find(SG->services_remaining.begin(), SG->services_remaining.end(),
-                  svc);
-    assert(member != SG->services_remaining.end());
-    assert(*member == svc);
-    SG->services_remaining.erase(member);
+    auto rmember = find(SG->services_remaining.begin(), SG->services_remaining.end(), svc);
+    assert(rmember != SG->services_remaining.end());
+    assert(*rmember == svc);
+    SG->services_remaining.erase(rmember);
   }
 
   SG->services_finished.push_back(svc);
@@ -2387,6 +2367,15 @@ static void servicescan_connect_handler(nsock_pool nsp, nsock_event nse, void *m
         }
       } else {
         svc->ssl_session = (SSL_SESSION *)(nsock_iod_get_ssl_session(nsi, 1));
+      }
+
+      SSL *ssl = (SSL *) nsock_iod_get_ssl(nsi);
+      if (ssl != NULL) {
+        const unsigned char *alpn = NULL;
+        unsigned int alpnlen = 0;
+        SSL_get0_alpn_selected(ssl, &alpn, &alpnlen);
+        if (alpnlen == 2 && memcmp(alpn, "h2", 2) == 0)
+          svc->tls_alpn_h2 = true;
       }
     }
 #endif
@@ -2483,7 +2472,7 @@ static void servicescan_write_handler(nsock_pool nsp, nsock_event nse, void *myd
 
 /* Returns true if this is a new hard match, false if not a match or if a softmatch */
 static bool processMatch(const struct MatchDetails *MD, ServiceNFO *svc,
-    const char *probeName, const char *fallbackName) {
+    std::string_view probeName, std::string_view fallbackName) {
   if (!MD || !MD->serviceName) {
     return false;
   }
@@ -2497,9 +2486,10 @@ static bool processMatch(const struct MatchDetails *MD, ServiceNFO *svc,
     return false;
   }
   if (o.debugging > 1 || o.versionTrace()) {
-    log_write(LOG_PLAIN, "Service scan %s match (Probe %s matched with %s line %d): %s:%hu is %s%s.  Version: |%s|%s|%s|\n",
+    log_write(LOG_PLAIN, "Service scan %s match (Probe %.*s matched with %.*s line %d): %s:%hu is %s%s.  Version: |%s|%s|%s|\n",
         (MD->isSoft)? "soft" : "hard",
-        probeName, fallbackName,
+        static_cast<int>(probeName.size()), probeName.data(),
+        static_cast<int>(fallbackName.size()), fallbackName.data(),
         MD->lineno,
         svc->target->targetipstr(), svc->portno, (svc->tunnel == SERVICE_TUNNEL_SSL)? "SSL/" : "",
         MD->serviceName, (MD->product)? MD->product : "", (MD->version)? MD->version : "",
@@ -2513,6 +2503,17 @@ static bool processMatch(const struct MatchDetails *MD, ServiceNFO *svc,
     Strncpy(svc->version_matched, MD->version, sizeof(svc->version_matched));
   if (MD->info)
     Strncpy(svc->extrainfo_matched, MD->info, sizeof(svc->extrainfo_matched));
+#if HAVE_OPENSSL
+  if (svc->tls_alpn_h2 && strstr(svc->extrainfo_matched, "h2") == NULL) {
+    if (*svc->extrainfo_matched) {
+      char tmp[kServiceExtraLen];
+      Snprintf(tmp, sizeof(tmp), "%s h2", svc->extrainfo_matched);
+      Strncpy(svc->extrainfo_matched, tmp, sizeof(svc->extrainfo_matched));
+    } else {
+      Strncpy(svc->extrainfo_matched, "h2", sizeof(svc->extrainfo_matched));
+    }
+  }
+#endif
   if (MD->hostname)
     Strncpy(svc->hostname_matched, MD->hostname, sizeof(svc->hostname_matched));
   if (MD->ostype)
@@ -2553,36 +2554,57 @@ static void servicescan_read_handler(nsock_pool nsp, nsock_event nse, void *myda
     // now get the full version
     readstr = svc->getcurrentproberesponse(&readstrlen);
 
-    const struct MatchDetails *MD = NULL;
-    ServiceProbe *fallback = NULL;
-    for (int fallbackDepth=0; fallbackDepth < MAXFALLBACKS + 1; fallbackDepth++) {
-      fallback = probe->fallbacks[fallbackDepth];
+    std::optional<std::pair<const struct MatchDetails *, ServiceProbe *>> matched_fallback;
+    for (int fallbackDepth = 0; fallbackDepth < MAXFALLBACKS + 1; fallbackDepth++) {
+      auto *fallback = probe->fallbacks[fallbackDepth];
       if (fallback == NULL)
         break;
-      MD = fallback->testMatch(readstr, readstrlen);
-      if (MD && MD->serviceName) break; // Found one!
+      if (const auto *MD = fallback->testMatch(readstr, readstrlen); MD && MD->serviceName) {
+        matched_fallback = std::make_pair(MD, fallback);
+        break; // Found one!
+      }
     }
 
-    if (fallback && processMatch(MD, svc, probe->getName(), fallback->getName())) {
+    if (matched_fallback) {
+      const auto &[MD, fallback] = *matched_fallback;
+      if (processMatch(MD, svc, probe->getName(), fallback->getName())) {
       // hard match!
       // We might be able to continue scan through a tunnel protocol
       // like SSL
-      if (scanThroughTunnel(svc)) {
-        startNextProbe(nsp, nsi, SG, svc, true);
+        if (scanThroughTunnel(svc)) {
+          startNextProbe(nsp, nsi, SG, svc, true);
+        } else {
+          end_svcprobe(PROBESTATE_FINISHED_HARDMATCHED, SG, svc, nsi);
+        }
+      } else {
+        // Didn't match... maybe reading more until timeout will help
+        // TODO: For efficiency I should be able to test if enough data
+        // has been received rather than always waiting for the reading
+        // to timeout.  For now I'll limit it to 4096 bytes just to
+        // avoid reading megs from services like chargen.  But better
+        // approach is needed.
+        constexpr int kMaxReadForAccumulation = 4096;
+        if (const int time_left = svc->probe_timemsleft(probe);
+            time_left > 0 && readstrlen < kMaxReadForAccumulation) {
+          nsock_read(nsp, nsi, servicescan_read_handler, time_left, svc);
+        } else {
+          // Failed -- lets go to the next probe.
+          if (readstrlen > 0)
+            svc->addToServiceFingerprint(probe->getName(), readstr, readstrlen);
+          startNextProbe(nsp, nsi, SG, svc, false);
+        }
       }
-      else {
-        end_svcprobe(PROBESTATE_FINISHED_HARDMATCHED, SG, svc, nsi);
-      }
-    }
-    else {
+    } else {
       // Didn't match... maybe reading more until timeout will help
       // TODO: For efficiency I should be able to test if enough data
       // has been received rather than always waiting for the reading
       // to timeout.  For now I'll limit it to 4096 bytes just to
       // avoid reading megs from services like chargen.  But better
       // approach is needed.
-      if (svc->probe_timemsleft(probe) > 0 && readstrlen < 4096) {
-        nsock_read(nsp, nsi, servicescan_read_handler, svc->probe_timemsleft(probe), svc);
+      constexpr int kMaxReadForAccumulation = 4096;
+      if (const int time_left = svc->probe_timemsleft(probe);
+          time_left > 0 && readstrlen < kMaxReadForAccumulation) {
+        nsock_read(nsp, nsi, servicescan_read_handler, time_left, svc);
       } else {
         // Failed -- lets go to the next probe.
         if (readstrlen > 0)
@@ -2728,37 +2750,35 @@ static int shouldWePrintFingerprint(ServiceNFO *svc) {
 // Nmap to output later.
 
 static void processResults(ServiceGroup *SG) {
-std::list<ServiceNFO *>::iterator svc;
-
- for(svc = SG->services_finished.begin(); svc != SG->services_finished.end(); svc++) {
-   if ((*svc)->probe_state != PROBESTATE_FINISHED_NOMATCH) {
+ for (auto *svc : SG->services_finished) {
+   if (svc->probe_state != PROBESTATE_FINISHED_NOMATCH) {
      std::vector<const char *> cpe;
 
-     if (*(*svc)->cpe_a_matched)
-       cpe.push_back((*svc)->cpe_a_matched);
-     if (*(*svc)->cpe_h_matched)
-       cpe.push_back((*svc)->cpe_h_matched);
-     if (*(*svc)->cpe_o_matched)
-       cpe.push_back((*svc)->cpe_o_matched);
+     if (*svc->cpe_a_matched)
+       cpe.push_back(svc->cpe_a_matched);
+     if (*svc->cpe_h_matched)
+       cpe.push_back(svc->cpe_h_matched);
+     if (*svc->cpe_o_matched)
+       cpe.push_back(svc->cpe_o_matched);
 
-     (*svc)->target->ports.setServiceProbeResults((*svc)->portno, (*svc)->proto,
-                                          (*svc)->probe_state,
-                                          (*svc)->probe_matched,
-                                          (*svc)->tunnel,
-                                          *(*svc)->product_matched? (*svc)->product_matched : NULL,
-                                          *(*svc)->version_matched? (*svc)->version_matched : NULL,
-                                          *(*svc)->extrainfo_matched? (*svc)->extrainfo_matched : NULL,
-                                          *(*svc)->hostname_matched? (*svc)->hostname_matched : NULL,
-                                          *(*svc)->ostype_matched? (*svc)->ostype_matched : NULL,
-                                          *(*svc)->devicetype_matched? (*svc)->devicetype_matched : NULL,
-                                          (cpe.size() > 0) ? &cpe : NULL,
-                                          shouldWePrintFingerprint(*svc) ? (*svc)->getServiceFingerprint(NULL) : NULL);
+     svc->target->ports.setServiceProbeResults(svc->portno, svc->proto,
+                                          svc->probe_state,
+                                          svc->probe_matched,
+                                          svc->tunnel,
+                                          *svc->product_matched? svc->product_matched : NULL,
+                                          *svc->version_matched? svc->version_matched : NULL,
+                                          *svc->extrainfo_matched? svc->extrainfo_matched : NULL,
+                                          *svc->hostname_matched? svc->hostname_matched : NULL,
+                                          *svc->ostype_matched? svc->ostype_matched : NULL,
+                                          *svc->devicetype_matched? svc->devicetype_matched : NULL,
+                                          !cpe.empty() ? &cpe : NULL,
+                                          shouldWePrintFingerprint(svc) ? svc->getServiceFingerprint(NULL) : NULL);
    }  else {
-       (*svc)->target->ports.setServiceProbeResults((*svc)->portno, (*svc)->proto,
-                                            (*svc)->probe_state, NULL,
-                                            (*svc)->tunnel, NULL, NULL, NULL, NULL, NULL, NULL,
+       svc->target->ports.setServiceProbeResults(svc->portno, svc->proto,
+                                            svc->probe_state, NULL,
+                                            svc->tunnel, NULL, NULL, NULL, NULL, NULL, NULL,
                                             NULL,
-                                            (*svc)->getServiceFingerprint(NULL));
+                                            svc->getServiceFingerprint(NULL));
    }
  }
 }
@@ -2768,13 +2788,10 @@ std::list<ServiceNFO *>::iterator svc;
 // pairs that are excluded. We use AP->isExcluded() to determine which ports
 // are excluded.
 static void remove_excluded_ports(AllProbes *AP, ServiceGroup *SG) {
-  std::list<ServiceNFO *>::iterator i, nxt;
   ServiceNFO *svc;
 
-  for(i = SG->services_remaining.begin(); i != SG->services_remaining.end(); i=nxt) {
-    nxt = i;
-    nxt++;
-
+  for (auto i = SG->services_remaining.begin(); i != SG->services_remaining.end(); ) {
+    const auto nxt = std::next(i);
     svc = *i;
     if (AP->isExcluded(svc->portno, svc->proto)) {
 
@@ -2790,6 +2807,7 @@ static void remove_excluded_ports(AllProbes *AP, ServiceGroup *SG) {
       SG->services_remaining.erase(i);
       SG->services_finished.push_back(svc);
     }
+    i = nxt;
   }
 
 }

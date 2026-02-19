@@ -80,6 +80,12 @@ extern NmapOps o;
 
 #include <math.h>
 #include <stdlib.h>
+#include <array>
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
 #include "zig/fp_match.h"
 
 
@@ -90,6 +96,12 @@ extern NmapOps o;
 /* This is the global network controller. FPHost classes use it to request
  * network resources and schedule packet transmissions. */
 FPNetworkControl global_netctl;
+
+namespace {
+constexpr std::size_t kMaxExplicitBpfTargets = 20;
+constexpr std::size_t kPcapFilterSize = 2048;
+constexpr std::size_t kDstHostsSize = 1220;
+} // namespace
 
 
 /******************************************************************************
@@ -316,9 +328,9 @@ int FPNetworkControl::register_caller(FPHost *newcaller) {
  * the controller does not call them back again. This is called by hosts that
  * have already finished their OS detection. */
 int FPNetworkControl::unregister_caller(FPHost *oldcaller) {
-  for (size_t i = 0; i < this->callers.size(); i++) {
-    if (this->callers[i] == oldcaller) {
-      this->callers.erase(this->callers.begin() + i);
+  for (auto it = this->callers.begin(); it != this->callers.end(); ++it) {
+    if (*it == oldcaller) {
+      this->callers.erase(it);
       return OP_SUCCESS;
     }
   }
@@ -330,7 +342,6 @@ int FPNetworkControl::unregister_caller(FPHost *oldcaller) {
  * obtains a pcap descriptor from nsock and sets an appropriate BPF filter. */
 int FPNetworkControl::setup_sniffer(const char *iface, const char *bpf_filter) {
   char pcapdev[128];
-  int rc;
 
 #ifdef WIN32
   /* Nmap normally uses device names obtained through dnet for interfaces, but
@@ -345,8 +356,7 @@ int FPNetworkControl::setup_sniffer(const char *iface, const char *bpf_filter) {
 #endif
 
   /* Obtain a pcap descriptor */
-  rc = nsock_pcap_open(this->nsp, this->pcap_nsi, pcapdev, 8192, 0, bpf_filter);
-  if (rc)
+  if (const int rc = nsock_pcap_open(this->nsp, this->pcap_nsi, pcapdev, 8192, 0, bpf_filter); rc)
     fatal("Error opening capture device %s\n", pcapdev);
 
   /* Store the pcap NSI inside the pool so we can retrieve it inside a callback */
@@ -478,8 +488,6 @@ void FPNetworkControl::response_reception_handler(nsock_pool nsp, nsock_event ns
   memset(&rcvd_ss, 0, sizeof(struct sockaddr_storage));
   IPv4Header ip4;
   IPv6Header ip6;
-  int res = -1;
-
   struct timeval tv;
   gettimeofday(&tv, NULL);
 
@@ -512,10 +520,10 @@ void FPNetworkControl::response_reception_handler(nsock_pool nsp, nsock_event ns
         }
 
         /* Check if we have a caller that expects packets from this sender */
-        for (size_t i = 0; i < this->callers.size(); i++) {
+        for (auto *caller : this->callers) {
 
           /* Obtain the target address */
-          sent_ss = *this->callers[i]->getTargetAddress();
+          sent_ss = *caller->getTargetAddress();
 
           /* Check that the received packet is of the same address family */
           if (sent_ss.ss_family != rcvd_ss.ss_family)
@@ -525,7 +533,7 @@ void FPNetworkControl::response_reception_handler(nsock_pool nsp, nsock_event ns
            * target address. If it matches, pass the received packet
            * to the appropriate FPHost object through callback().  */
           if (sockaddr_storage_equal(&rcvd_ss, &sent_ss)) {
-            if ((res = this->callers[i]->callback(rcvd_pkt, rcvd_pkt_len, &tv)) >= 0) {
+            if (const int res = caller->callback(rcvd_pkt, rcvd_pkt_len, &tv); res >= 0) {
 
                /* If callback() returns >=0 it means that the packet we've just
                 * passed was successfully matched with a previous probe. Now
@@ -605,26 +613,27 @@ FPEngine::~FPEngine() {
  * dst host fe80::250:56ff:fec0:1
  */
 const char *FPEngine::bpf_filter(std::vector<Target *> &Targets) {
-  static char pcap_filter[2048];
+  static char pcap_filter[kPcapFilterSize];
   /* 20 IPv6 addresses is max (46 byte addy + 14 (" or src host ")) * 20 == 1200 */
-  char dst_hosts[1220];
+  char dst_hosts[kDstHostsSize];
   int filterlen = 0;
   int len = 0;
-  unsigned int targetno;
   memset(pcap_filter, 0, sizeof(pcap_filter));
 
   /* If we have 20 or less targets, build a list of addresses so we can set
    * an explicit BPF filter */
-  if (Targets.size() <= 20) {
-    for (targetno = 0; targetno < Targets.size(); targetno++) {
+  if (Targets.size() <= kMaxExplicitBpfTargets) {
+    bool first_target = true;
+    for (const auto *target : Targets) {
       len = Snprintf(dst_hosts + filterlen,
                      sizeof(dst_hosts) - filterlen,
-                     "%ssrc host %s", (targetno == 0)? "" : " or ",
-                     Targets[targetno]->targetipstr());
+                     "%ssrc host %s", first_target ? "" : " or ",
+                     target->targetipstr());
 
       if (len < 0 || len + filterlen >= (int) sizeof(dst_hosts))
         fatal("ran out of space in dst_hosts");
       filterlen += len;
+      first_target = false;
     }
 
     len = Snprintf(pcap_filter, sizeof(pcap_filter), "dst host %s and (%s)",
@@ -719,20 +728,14 @@ static const ICMPv6Header *find_icmpv6(const PacketElement *pe) {
 }
 
 static double vectorize_plen(const PacketElement *pe) {
-  const IPv6Header *ipv6;
-
-  ipv6 = find_ipv6(pe);
-  if (ipv6 == NULL)
+  if (const auto *ipv6 = find_ipv6(pe); ipv6 == NULL)
     return -1;
   else
     return ipv6->getPayloadLength();
 }
 
 static double vectorize_tc(const PacketElement *pe) {
-  const IPv6Header *ipv6;
-
-  ipv6 = find_ipv6(pe);
-  if (ipv6 == NULL)
+  if (const auto *ipv6 = find_ipv6(pe); ipv6 == NULL)
     return -1;
   else
     return ipv6->getTrafficClass();
@@ -743,14 +746,13 @@ static double vectorize_tc(const PacketElement *pe) {
  * http://seclists.org/nmap-dev/2015/q1/218
  */
 static int vectorize_hlim(const PacketElement *pe, int target_distance, enum dist_calc_method method) {
-  const IPv6Header *ipv6;
   int hlim;
   int er_lim;
 
-  ipv6 = find_ipv6(pe);
-  if (ipv6 == NULL)
+  if (const auto *ipv6 = find_ipv6(pe); ipv6 == NULL)
     return -1;
-  hlim = ipv6->getHopLimit();
+  else
+    hlim = ipv6->getHopLimit();
 
   if (method != DIST_METHOD_NONE) {
       if (method == DIST_METHOD_TRACEROUTE || method == DIST_METHOD_ICMP) {
@@ -776,39 +778,32 @@ static int vectorize_hlim(const PacketElement *pe, int target_distance, enum dis
 }
 
 static double vectorize_isr(std::map<std::string, FPPacket>& resps) {
-  const char * const SEQ_PROBE_NAMES[] = {"S1", "S2", "S3", "S4", "S5", "S6"};
-  u32 seqs[NELEMS(SEQ_PROBE_NAMES)];
-  struct timeval times[NELEMS(SEQ_PROBE_NAMES)];
-  unsigned int i, j;
+  constexpr std::array<std::string_view, 6> kSeqProbeNames{{"S1", "S2", "S3", "S4", "S5", "S6"}};
+  u32 seqs[kSeqProbeNames.size()];
+  struct timeval times[kSeqProbeNames.size()];
+  unsigned int j;
   double sum, t;
 
   j = 0;
-  for (i = 0; i < NELEMS(SEQ_PROBE_NAMES); i++) {
-    const char *probe_name;
-    const FPPacket *fp;
-    const TCPHeader *tcp;
-    std::map<std::string, FPPacket>::const_iterator it;
-
-    probe_name = SEQ_PROBE_NAMES[i];
-    it = resps.find(probe_name);
-    if (it == resps.end())
+  for (const auto probe_name : kSeqProbeNames) {
+    if (const auto it = resps.find(std::string(probe_name)); it == resps.end()) {
       continue;
-
-    fp = &it->second;
-    tcp = find_tcp(fp->getPacket());
-    if (tcp == NULL)
-      continue;
-
-    seqs[j] = tcp->getSeq();
-    times[j] = fp->getTime();
-    j++;
+    } else {
+      const auto& [name, fp] = *it;
+      (void)name;
+      if (const auto *tcp = find_tcp(fp.getPacket()); tcp != NULL) {
+        seqs[j] = tcp->getSeq();
+        times[j] = fp.getTime();
+        j++;
+      }
+    }
   }
 
   if (j < 2)
     return -1;
 
   sum = 0.0;
-  for (i = 0; i < j - 1; i++)
+  for (unsigned int i = 0; i < j - 1; i++)
     sum += seqs[i + 1] - seqs[i];
   t = TIMEVAL_FSEC_SUBTRACT(times[j - 1], times[0]);
 
@@ -836,9 +831,11 @@ static int vectorize_icmpv6_code(const PacketElement *pe) {
 }
 
 static struct feature_node *vectorize(const FingerPrintResultsIPv6 *FPR) {
-  const char * const IPV6_PROBE_NAMES[] = {"S1", "S2", "S3", "S4", "S5", "S6", "IE1", "IE2", "NS", "U1", "TECN", "T2", "T3", "T4", "T5", "T6", "T7"};
-  const char * const TCP_PROBE_NAMES[] = {"S1", "S2", "S3", "S4", "S5", "S6", "TECN", "T2", "T3", "T4", "T5", "T6", "T7"};
-  const char * const ICMPV6_PROBE_NAMES[] = {"IE1", "IE2", "NS"};
+  constexpr std::array<const char *, 17> kIPv6ProbeNames{
+    {"S1", "S2", "S3", "S4", "S5", "S6", "IE1", "IE2", "NS", "U1", "TECN", "T2", "T3", "T4", "T5", "T6", "T7"}};
+  constexpr std::array<const char *, 13> kTCPProbeNames{
+    {"S1", "S2", "S3", "S4", "S5", "S6", "TECN", "T2", "T3", "T4", "T5", "T6", "T7"}};
+  constexpr std::array<const char *, 3> kICMPv6ProbeNames{{"IE1", "IE2", "NS"}};
 
   unsigned int nr_feature, i, idx;
   struct feature_node *features;
@@ -864,18 +861,14 @@ static struct feature_node *vectorize(const FingerPrintResultsIPv6 *FPR) {
   features[i].index = -1;
 
   idx = 0;
-  for (i = 0; i < NELEMS(IPV6_PROBE_NAMES); i++) {
-    const char *probe_name;
-
-    probe_name = IPV6_PROBE_NAMES[i];
+  for (const auto *probe_name : kIPv6ProbeNames) {
     features[idx++].value = vectorize_plen(resps[probe_name].getPacket());
     features[idx++].value = vectorize_tc(resps[probe_name].getPacket());
     features[idx++].value = vectorize_hlim(resps[probe_name].getPacket(), FPR->distance, FPR->distance_calculation_method);
   }
   /* TCP features */
   features[idx++].value = vectorize_isr(resps);
-  for (i = 0; i < NELEMS(TCP_PROBE_NAMES); i++) {
-    const char *probe_name;
+  for (const auto *probe_name : kTCPProbeNames) {
     const TCPHeader *tcp;
     u16 flags;
     u16 mask;
@@ -883,9 +876,6 @@ static struct feature_node *vectorize(const FingerPrintResultsIPv6 *FPR) {
     int mss;
     int sackok;
     int wscale;
-
-    probe_name = TCP_PROBE_NAMES[i];
-
     mss = -1;
     sackok = -1;
     wscale = -1;
@@ -902,8 +892,7 @@ static struct feature_node *vectorize(const FingerPrintResultsIPv6 *FPR) {
       features[idx++].value = (flags & mask) != 0;
 
     for (j = 0; j < 16; j++) {
-      nping_tcp_opt_t opt;
-      opt = tcp->getOption(j);
+      const auto opt = tcp->getOption(j);
       if (opt.value == NULL)
         break;
       features[idx++].value = opt.type;
@@ -919,8 +908,7 @@ static struct feature_node *vectorize(const FingerPrintResultsIPv6 *FPR) {
       idx++;
 
     for (j = 0; j < 16; j++) {
-      nping_tcp_opt_t opt;
-      opt = tcp->getOption(j);
+      const auto opt = tcp->getOption(j);
       if (opt.value == NULL)
         break;
       features[idx++].value = opt.len;
@@ -937,10 +925,7 @@ static struct feature_node *vectorize(const FingerPrintResultsIPv6 *FPR) {
       features[idx++].value = -1;
   }
   /* ICMPv6 features */
-  for (i = 0; i < NELEMS(ICMPV6_PROBE_NAMES); i++) {
-    const char *probe_name;
-
-    probe_name = ICMPV6_PROBE_NAMES[i];
+  for (const auto *probe_name : kICMPv6ProbeNames) {
     features[idx++].value = vectorize_icmpv6_type(resps[probe_name].getPacket());
     features[idx++].value = vectorize_icmpv6_code(resps[probe_name].getPacket());
   }
@@ -1145,44 +1130,40 @@ static double *novelty_batch(const struct feature_node *features) {
   }
 
   /* Allocate scores array and run batch SIMD distance. */
-  float *scores = new float[nr_class];
+  auto scores = std::make_unique<float[]>(nr_class);
   fp_distance_batch(obs, (uint32_t)nr_feature, cached_ref_db,
-                    (uint32_t)nr_class, (uint32_t)stride, scores);
+                    (uint32_t)nr_class, (uint32_t)stride, scores.get());
 
   /* Convert squared distances to sqrt (matching novelty_of semantics). */
-  double *novelties = new double[nr_class];
+  auto novelties = std::make_unique<double[]>(nr_class);
   for (int i = 0; i < nr_class; i++)
     novelties[i] = sqrt((double)scores[i]);
 
-  delete[] scores;
-  return novelties;
+  return novelties.release();
 }
 
 static void classify(FingerPrintResultsIPv6 *FPR) {
   int nr_class, i;
-  struct feature_node *features;
-  double *values;
-  struct label_prob *labels;
 
   nr_class = get_nr_class(&FPModel);
 
-  features = vectorize(FPR);
-  values = new double[nr_class];
-  labels = new struct label_prob[nr_class];
+  auto features = std::unique_ptr<feature_node[]>(vectorize(FPR));
+  auto values = std::make_unique<double[]>(nr_class);
+  auto labels = std::make_unique<struct label_prob[]>(nr_class);
 
-  apply_scale(features, get_nr_feature(&FPModel), FPscale);
+  apply_scale(features.get(), get_nr_feature(&FPModel), FPscale);
 
-  predict_values(&FPModel, features, values);
+  predict_values(&FPModel, features.get(), values.get());
   for (i = 0; i < nr_class; i++) {
     labels[i].label = i;
     labels[i].prob = 1.0 / (1.0 + exp(-values[i]));
   }
-  qsort(labels, nr_class, sizeof(labels[0]), label_prob_cmp);
+  qsort(labels.get(), nr_class, sizeof(labels[0]), label_prob_cmp);
 
   /* Precompute all class novelties in a single SIMD batch pass.
      This replaces per-label novelty_of() calls that each had their own
      alloca+packing overhead. The reference DB is cached across calls. */
-  double *all_novelties = novelty_batch(features);
+  auto all_novelties = std::unique_ptr<double[]>(novelty_batch(features.get()));
 
   for (i = 0; i < nr_class && i < MAX_FP_RESULTS; i++) {
     FPR->matches[i] = &o.os_labels_ipv6[labels[i].label];
@@ -1219,10 +1200,6 @@ static void classify(FingerPrintResultsIPv6 *FPR) {
     FPR->num_perfect_matches = 0;
   }
 
-  delete[] all_novelties;
-  delete[] features;
-  delete[] values;
-  delete[] labels;
 }
 
 
@@ -1246,14 +1223,14 @@ int FPEngine6::os_scan(std::vector<Target *> &Targets) {
   /* Initialize variables, timers, etc. */
   gettimeofday(&begin_time, NULL);
   global_netctl.init(Targets[0]->deviceName(), Targets[0]->ifType());
-  for (size_t i = 0; i < Targets.size(); i++) {
+  for (auto *target : Targets) {
     if (o.debugging > 3) {
       log_write(LOG_PLAIN, "[FPEngine] Allocating FPHost6 for %s %s\n",
-        Targets[i]->targetipstr(), Targets[i]->sourceipstr());
+        target->targetipstr(), target->sourceipstr());
     }
-    FPHost6 *newhost = new FPHost6(Targets[i], &global_netctl);
+    auto newhost = std::make_unique<FPHost6>(target, &global_netctl);
     newhost->begin_time = begin_time;
-    fphosts.push_back(newhost);
+    fphosts.push_back(newhost.release());
   }
 
   /* Build the BPF filter */
@@ -1338,11 +1315,9 @@ int FPEngine6::os_scan(std::vector<Target *> &Targets) {
   }
 
   /* Cleanup and return */
-  while (this->fphosts.size() > 0) {
-    FPHost6 *tmp = fphosts.back();
-    delete tmp;
-    fphosts.pop_back();
-  }
+  for (auto *host : this->fphosts)
+    delete host;
+  this->fphosts.clear();
 
   if (o.debugging)
     log_write(LOG_PLAIN, "IPv6 OS Scan completed.\n");
@@ -1631,22 +1606,18 @@ static int get_encapsulated_hoplimit(const PacketElement *pe) {
 void FPHost6::finish() {
   /* These probes are likely to get an ICMPv6 error (allowing us to calculate
      distance. */
-  const char * const DISTANCE_PROBE_NAMES[] = { "IE2", "U1" };
+  constexpr std::array<const char *, 2> kDistanceProbeNames{{"IE2", "U1"}};
   int distance = -1;
   int hoplimit_distance = -1;
   enum dist_calc_method distance_calculation_method = DIST_METHOD_NONE;
-  unsigned int i;
 
   /* Calculate distance based on hop limit difference. */
-  for (i = 0; i < NELEMS(DISTANCE_PROBE_NAMES); i++) {
+  for (const auto *probe_name : kDistanceProbeNames) {
     const FPProbe *probe;
     const FPResponse *resp;
     const PacketElement *probe_pe;
     PacketElement *resp_pe;
     int sent_ttl, rcvd_ttl;
-    const char *probe_name;
-
-    probe_name = DISTANCE_PROBE_NAMES[i];
     probe = this->getProbe(probe_name);
     resp = this->getResponse(probe_name);
     if (probe == NULL || resp == NULL)
@@ -1723,12 +1694,9 @@ static IPv6Header *make_tcp(const struct sockaddr_in6 *src,
   const struct sockaddr_in6 *dst,
   u32 fl, u16 win, u32 seq, u32 ack, u8 flags, u16 srcport, u16 dstport,
   u16 urgptr, const char *opts, unsigned int optslen) {
-  IPv6Header *ip6;
-  TCPHeader *tcp;
-
   /* Allocate an instance of the protocol headers */
-  ip6 = new IPv6Header();
-  tcp = new TCPHeader();
+  auto ip6 = std::make_unique<IPv6Header>();
+  auto tcp = std::make_unique<TCPHeader>();
 
   ip6->setSourceAddress(src->sin6_addr);
   ip6->setDestinationAddress(dst->sin6_addr);
@@ -1736,7 +1704,7 @@ static IPv6Header *make_tcp(const struct sockaddr_in6 *src,
   ip6->setFlowLabel(fl);
   ip6->setHopLimit(get_hoplimit());
   ip6->setNextHeader("TCP");
-  ip6->setNextElement(tcp);
+  ip6->setNextElement(tcp.get());
 
   tcp->setWindow(win);
   tcp->setSeq(seq);
@@ -1750,7 +1718,8 @@ static IPv6Header *make_tcp(const struct sockaddr_in6 *src,
   ip6->setPayloadLength(tcp->getLen());
   tcp->setSum();
 
-  return ip6;
+  tcp.release();
+  return ip6.release();
 }
 
 /* This method generates the list of OS detection probes to be sent to the
@@ -2283,14 +2252,17 @@ int FPHost6::schedule() {
 
       /* Count the number of responses we have now and the number
        * of responses we stored in the aux buffer last time. */
-      unsigned int responses_stored = 0;
-      unsigned int responses_now = 0;
-      for (unsigned int j = 0; j < this->timed_probes; j++) {
-        if (this->aux_resp[j] != NULL)
-          responses_stored++;
-        if (this->fp_responses[j] != NULL)
-          responses_now++;
-      }
+      const auto [responses_stored, responses_now] = [this]() {
+        unsigned int stored = 0;
+        unsigned int now = 0;
+        for (unsigned int j = 0; j < this->timed_probes; j++) {
+          if (this->aux_resp[j] != NULL)
+            stored++;
+          if (this->fp_responses[j] != NULL)
+            now++;
+        }
+        return std::pair<unsigned int, unsigned int>{stored, now};
+      }();
 
       /* If now we have more responses than before, copy our current
        * set of responses to the aux array. Otherwise, just
@@ -2365,14 +2337,17 @@ int FPHost6::set_done_and_wrap_up() {
    * these loops run if timed_probes == 0, so it's safe in all cases. */
 
   /* First count the number of responses in each set.  */
-  unsigned int stored = 0;
-  unsigned int current = 0;
-  for (unsigned int i = 0; i < this->timed_probes; i++) {
-    if (this->aux_resp[i] != NULL)
-      stored++;
-    if (this->fp_responses[i] != NULL)
-      current++;
-  }
+  const auto [stored, current] = [this]() {
+    unsigned int local_stored = 0;
+    unsigned int local_current = 0;
+    for (unsigned int i = 0; i < this->timed_probes; i++) {
+      if (this->aux_resp[i] != NULL)
+        local_stored++;
+      if (this->fp_responses[i] != NULL)
+        local_current++;
+    }
+    return std::pair<unsigned int, unsigned int>{local_stored, local_current};
+  }();
   /* If we got more responses in a previous try, use them and get rid of
    * the current ones. */
   if (stored > current) {
@@ -2492,28 +2467,40 @@ int FPHost6::callback(const u8 *pkt, size_t pkt_len, const struct timeval *tv) {
   }
 }
 
+static std::optional<unsigned int> find_probe_index(const FPProbe (&probes)[NUM_FP_PROBES_IPv6], std::string_view id) {
+  for (unsigned int i = 0; i < NUM_FP_PROBES_IPv6; i++) {
+    if (!probes[i].is_set())
+      continue;
+    if (std::string_view(probes[i].getProbeID()) == id)
+      return i;
+  }
+
+  return std::nullopt;
+}
+
+static std::optional<unsigned int> find_response_index(FPResponse *const (&responses)[NUM_FP_PROBES_IPv6], std::string_view id) {
+  for (unsigned int i = 0; i < NUM_FP_PROBES_IPv6; i++) {
+    if (responses[i] == NULL)
+      continue;
+    if (std::string_view(responses[i]->probe_id) == id)
+      return i;
+  }
+
+  return std::nullopt;
+}
+
 
 const FPProbe *FPHost6::getProbe(const char *id) {
-  unsigned int i;
-
-  for (i = 0; i < NUM_FP_PROBES_IPv6; i++) {
-    if (!this->fp_probes[i].is_set())
-      continue;
-    if (strcmp(this->fp_probes[i].getProbeID(), id) == 0)
-      return &this->fp_probes[i];
+  if (const auto idx = find_probe_index(this->fp_probes, id); idx.has_value()) {
+    return &this->fp_probes[*idx];
   }
 
   return NULL;
 }
 
 const FPResponse *FPHost6::getResponse(const char *id) {
-  unsigned int i;
-
-  for (i = 0; i < NUM_FP_PROBES_IPv6; i++) {
-    if (this->fp_responses[i] == NULL)
-      continue;
-    if (strcmp(this->fp_responses[i]->probe_id, id) == 0)
-      return this->fp_responses[i];
+  if (const auto idx = find_response_index(this->fp_responses, id); idx.has_value()) {
+    return this->fp_responses[*idx];
   }
 
   return NULL;
